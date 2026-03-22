@@ -168,10 +168,14 @@ def tool_read_file(path: str) -> str:
         return f"Error: {e}"
 
 
+_MAX_WRITE_CHARS = 2_000_000   # 2 MB safety limit
+
 def tool_write_file(path: str, content: str) -> str:
     p, err = safe_path(path)
     if err:
         return f"Error: {err}"
+    if len(content) > _MAX_WRITE_CHARS:
+        return f"Error: content too large ({len(content):,} chars, limit {_MAX_WRITE_CHARS:,})"
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
@@ -221,7 +225,7 @@ def tool_grep(pattern: str, path: str = ".") -> str:
         return f"Error: {err}"
     try:
         res = subprocess.run(
-            ["grep", "-rn", pattern, str(p)],
+            ["grep", "-rn", "--", pattern, str(p)],   # "--" prevents pattern-as-flag
             capture_output=True, text=True, timeout=15, cwd=str(WORKDIR),
         )
         out = res.stdout or res.stderr or "(no matches)"
@@ -261,6 +265,16 @@ def tool_shell(command: str) -> str:
     # Extra guard: reject shell metacharacters in raw command string
     if any(c in command for c in '|&;$`><()!'):
         return "Error: shell metacharacters not allowed"
+
+    # Ensure any absolute-path arguments stay within WORKDIR
+    for arg in parts[1:]:
+        if arg.startswith("/") or arg.startswith("~"):
+            try:
+                resolved = Path(arg).expanduser().resolve()
+            except Exception:
+                return f"Error: invalid path argument: {arg!r}"
+            if not resolved.is_relative_to(WORKDIR):
+                return f"Error: path argument outside WORKDIR: {arg!r}"
 
     try:
         res = subprocess.run(
@@ -476,10 +490,26 @@ def _run_task(messages: list) -> str | None:
 
                 # Brief display label
                 label = args.get("path") or args.get("command") or args.get("pattern") or ""
-                print(f"⚡ {name} {label}", flush=True)
+                print(f"⚡ {name} {label}", end="", flush=True)
 
                 handler = TOOL_HANDLERS.get(name)
-                result  = handler(args) if handler else f"Error: unknown tool {name}"
+                try:
+                    result = handler(args) if handler else f"Error: unknown tool {name}"
+                except KeyError as e:
+                    result = f"Error: missing required argument {e}"
+                except Exception as e:
+                    result = f"Error: {e}"
+
+                # Show brief inline result
+                first_line = result.splitlines()[0] if result else ""
+                if result.startswith("Error"):
+                    print(f"  → {first_line}", flush=True)
+                elif result.startswith("OK"):
+                    print(f"  → {first_line}", flush=True)
+                else:
+                    n = len(result)
+                    lines = result.count("\n") + 1
+                    print(f"  → {lines} lines, {n} chars", flush=True)
 
                 worklog_tool(name, args, result)
 
@@ -692,12 +722,32 @@ def _update_context_from_session(messages: list) -> str | None:
 # ── Session persistence ───────────────────────────────────────────────────────
 
 SESSIONS_DIR       = WORKDIR / ".sessions"
-MAX_CONTEXT_CHARS  = 40_000   # ~10k tokens; offer summarization above this
+MAX_CONTEXT_CHARS  = int(os.environ.get("MAX_CONTEXT_CHARS", 1_000_000))  # ~256k tokens
+MAX_SESSIONS_KEEP  = int(os.environ.get("MAX_SESSIONS_KEEP", 50))
 
 
 def _sessions_dir() -> Path:
     SESSIONS_DIR.mkdir(exist_ok=True)
     return SESSIONS_DIR
+
+
+def _first_user_msg(messages: list) -> str:
+    """Return the first user message content (truncated), for session previews."""
+    for m in messages:
+        if m.get("role") == "user":
+            text = (m.get("content") or "").replace("\n", " ").strip()
+            return text[:80] + ("…" if len(text) > 80 else "")
+    return ""
+
+
+def _rotate_sessions(d: Path):
+    """Delete oldest session files beyond MAX_SESSIONS_KEEP."""
+    files = sorted(d.glob("session_*.json"), reverse=True)
+    for old in files[MAX_SESSIONS_KEEP:]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
 
 
 def session_save(messages: list) -> Path:
@@ -710,9 +760,11 @@ def session_save(messages: list) -> Path:
         "last_updated": datetime.now().isoformat(timespec="seconds"),
         "model":        MODEL,
         "workdir":      str(WORKDIR),
+        "preview":      _first_user_msg(messages),
         "messages":     messages,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    _rotate_sessions(d)
     return path
 
 
@@ -725,6 +777,7 @@ def session_autosave(messages: list, current_path: list):
             "last_updated": datetime.now().isoformat(timespec="seconds"),
             "model":        MODEL,
             "workdir":      str(WORKDIR),
+            "preview":      _first_user_msg(messages),
             "messages":     messages,
         }
         current_path[0].write_text(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -964,10 +1017,11 @@ def run_interactive(resume_path: Path | None = None):
             else:
                 for i, f in enumerate(files):
                     try:
-                        meta = json.loads(f.read_text())
-                        nm   = len([m for m in meta.get("messages", []) if m["role"] != "system"])
-                        ts   = meta.get("last_updated", f.stem)
-                        print(f"  [{i}] {f.name}  {nm} msgs  updated {ts}")
+                        meta    = json.loads(f.read_text())
+                        nm      = len([m for m in meta.get("messages", []) if m["role"] != "system"])
+                        ts      = meta.get("last_updated", f.stem)[:16]
+                        preview = meta.get("preview") or _first_user_msg(meta.get("messages", []))
+                        print(f"  [{i}] {ts}  {nm:>3} msgs  {preview}")
                     except Exception:
                         print(f"  [{i}] {f.name}")
                 print()
@@ -1024,7 +1078,28 @@ def run_oneshot(task: str):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
+    args = list(sys.argv[1:])
+
+    # Parse --model and --url overrides before anything else
+    def _pop_flag(flag: str) -> str | None:
+        for i, a in enumerate(args):
+            if a == flag and i + 1 < len(args):
+                args.pop(i); return args.pop(i)
+            if a.startswith(flag + "="):
+                args.pop(i); return a.split("=", 1)[1]
+        return None
+
+    if (v := _pop_flag("--model")):
+        MODEL = v
+    if (v := _pop_flag("--url")):
+        BASE_URL = v.rstrip("/")
+
+    # --init: generate .agent_context.md then exit
+    if args and args[0] == "--init":
+        print(f"microagent  |  workdir: {WORKDIR}  |  model: {MODEL}")
+        msgs_dummy: list = []   # no session context needed for init
+        _handle_context_command("/init", msgs_dummy)
+        sys.exit(0)
 
     # --resume [path|index]
     if args and args[0] == "--resume":
