@@ -235,22 +235,36 @@ def tool_grep(pattern: str, path: str = ".") -> str:
         return f"Error: {e}"
 
 
+# Removed rm, cp, mv, mkdir, cat — destructive or filesystem-escaping.
+# shell=False (list form) prevents metacharacter injection ($(), &&, |, ;, etc.)
 SHELL_WHITELIST = {
-    "find", "wc", "head", "tail", "cat", "mkdir", "cp", "mv", "rm",
+    "find", "wc", "head", "tail",
     "sort", "uniq", "diff", "echo", "pwd", "date",
 }
 
 def tool_shell(command: str) -> str:
-    parts = command.strip().split()
+    import shlex
+    try:
+        parts = shlex.split(command)
+    except ValueError as e:
+        return f"Error: cannot parse command: {e}"
+
     if not parts:
         return "Error: empty command"
+
     cmd = parts[0]
     if cmd not in SHELL_WHITELIST:
         allowed = ", ".join(sorted(SHELL_WHITELIST))
         return f"Error: '{cmd}' not allowed. Allowed commands: {allowed}"
+
+    # Extra guard: reject shell metacharacters in raw command string
+    if any(c in command for c in '|&;$`><()!'):
+        return "Error: shell metacharacters not allowed"
+
     try:
         res = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
+            parts,                   # list — no shell interpretation
+            capture_output=True, text=True,
             timeout=15, cwd=str(WORKDIR),
         )
         out = (res.stdout + res.stderr).strip() or "(no output)"
@@ -259,6 +273,8 @@ def tool_shell(command: str) -> str:
         return out
     except subprocess.TimeoutExpired:
         return "Error: command timed out (15s)"
+    except FileNotFoundError:
+        return f"Error: command not found: {cmd}"
     except Exception as e:
         return f"Error: {e}"
 
