@@ -9,6 +9,7 @@ Usage:
     WORKDIR=/path/to/project python agent.py   # specify working directory
 """
 
+import ast as _ast
 import http.client
 import json
 import os
@@ -407,7 +408,21 @@ def worklog_result(summary: str):
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = f"""You are a coding agent working in the directory: {WORKDIR}
+CONTEXT_FILE = WORKDIR / ".agent_context.md"
+
+
+def load_repo_context() -> str:
+    """Return injected context string if .agent_context.md exists, else ''."""
+    if CONTEXT_FILE.exists():
+        try:
+            content = CONTEXT_FILE.read_text().strip()
+            return f"\n\n---\n{content}\n---"
+        except Exception:
+            pass
+    return ""
+
+
+_SYSTEM_BASE = f"""You are a coding agent working in the directory: {WORKDIR}
 
 You can read, create, and edit files, and run basic shell commands.
 Always read a file before editing it.
@@ -419,6 +434,15 @@ definition, you MUST use grep to find every call site of that function across th
 codebase and update each one. Never leave callers out of sync with the new signature.
 
 When done, summarize what you did."""
+
+
+def build_system_prompt() -> str:
+    """Base prompt + repo context if .agent_context.md exists."""
+    return _SYSTEM_BASE + load_repo_context()
+
+
+# Keep SYSTEM_PROMPT as an alias used by session-load (overwritten at session start)
+SYSTEM_PROMPT = build_system_prompt()
 
 
 def _run_task(messages: list) -> str | None:
@@ -468,6 +492,201 @@ def _run_task(messages: list) -> str | None:
         else:
             text = msg.get("content") or ""
             return text
+
+
+# ── Repo context (.agent_context.md) ─────────────────────────────────────────
+#
+# Inspired by aider's repo-map and Cline's Memory Bank:
+# - scan_repo()  builds a compact file map using Python ast (no deps)
+# - /init        scan + ask model to write purpose & architecture notes
+# - /update      ask model to revise context based on current session
+# - /reinit      rescan + ask model to reconcile map with existing notes
+# The resulting .agent_context.md is injected into the system prompt on start.
+
+_SKIP_DIRS  = {".git", "__pycache__", "venv", ".venv", ".sessions",
+               "node_modules", "dist", "build", ".tox", ".mypy_cache"}
+_SKIP_FILES = {".agent_context.md", ".worklog.md"}
+
+
+def _func_sig(node) -> str:
+    """Reconstruct function signature string from AST node (no body)."""
+    args   = node.args
+    parts  = []
+    n_args = len(args.args)
+    n_def  = len(args.defaults)
+
+    for i, arg in enumerate(args.args):
+        if arg.arg == "self":
+            continue
+        di = i - (n_args - n_def)
+        if di >= 0:
+            try:
+                default = _ast.unparse(args.defaults[di])
+                parts.append(f"{arg.arg}={default}")
+            except Exception:
+                parts.append(arg.arg)
+        else:
+            parts.append(arg.arg)
+
+    for arg in args.posonlyargs:
+        parts.insert(0, arg.arg)
+
+    if args.vararg:
+        parts.append(f"*{args.vararg.arg}")
+    for kwarg in args.kwonlyargs:
+        parts.append(kwarg.arg)
+    if args.kwarg:
+        parts.append(f"**{args.kwarg.arg}")
+
+    prefix = "async def" if isinstance(node, _ast.AsyncFunctionDef) else "def"
+    return f"{prefix} {node.name}({', '.join(parts)})"
+
+
+def _scan_py(path: Path) -> dict:
+    """Parse one .py file → {docstring, defs:[{kind,sig/name,doc,line,methods?}]}."""
+    try:
+        tree = _ast.parse(path.read_text(errors="replace"))
+    except SyntaxError:
+        return {"docstring": None, "defs": []}
+
+    docstring = _ast.get_docstring(tree)
+    defs      = []
+
+    for node in _ast.iter_child_nodes(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            defs.append({
+                "kind": "func",
+                "sig":  _func_sig(node),
+                "doc":  (_ast.get_docstring(node) or "").split("\n")[0][:80],
+                "line": node.lineno,
+            })
+        elif isinstance(node, _ast.ClassDef):
+            methods = []
+            for item in _ast.iter_child_nodes(node):
+                if isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    methods.append({
+                        "sig":  _func_sig(item),
+                        "doc":  (_ast.get_docstring(item) or "").split("\n")[0][:80],
+                        "line": item.lineno,
+                    })
+            defs.append({
+                "kind":    "class",
+                "name":    node.name,
+                "doc":     (_ast.get_docstring(node) or "").split("\n")[0][:80],
+                "line":    node.lineno,
+                "methods": methods,
+            })
+
+    return {"docstring": docstring, "defs": defs}
+
+
+def scan_repo() -> str:
+    """
+    Walk WORKDIR, extract structure from .py files via ast,
+    list other notable files. Returns a compact markdown file-map string.
+    """
+    lines = []
+    other = []   # non-python notable files
+
+    for root, dirs, files in os.walk(WORKDIR):
+        root_path = Path(root)
+        # Prune ignored dirs in-place
+        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS and not d.startswith("."))
+
+        rel_root = root_path.relative_to(WORKDIR)
+
+        for fname in sorted(files):
+            fpath    = root_path / fname
+            rel_path = str(fpath.relative_to(WORKDIR))
+
+            if fname in _SKIP_FILES or fname.startswith("."):
+                continue
+
+            if fname.endswith(".py"):
+                info = _scan_py(fpath)
+                header = rel_path
+                if info["docstring"]:
+                    header += f" — {info['docstring'].split(chr(10))[0][:80]}"
+                lines.append(f"\n{header}")
+
+                for d in info["defs"]:
+                    if d["kind"] == "func":
+                        doc_hint = f"  # {d['doc']}" if d["doc"] else ""
+                        lines.append(f"  {d['sig']}{doc_hint}")
+                    elif d["kind"] == "class":
+                        doc_hint = f"  # {d['doc']}" if d["doc"] else ""
+                        lines.append(f"  class {d['name']}{doc_hint}")
+                        for m in d["methods"]:
+                            mdoc = f"  # {m['doc']}" if m["doc"] else ""
+                            lines.append(f"    {m['sig']}{mdoc}")
+            else:
+                # Include non-python files as a flat list (skip binaries by ext)
+                _skip_exts = {".pyc", ".pyo", ".jpg", ".jpeg", ".png", ".gif",
+                              ".ico", ".woff", ".woff2", ".ttf", ".eot",
+                              ".db", ".sqlite", ".sqlite3", ".lock"}
+                if fpath.suffix.lower() not in _skip_exts:
+                    other.append(rel_path)
+
+    result = "## File map\n" + "\n".join(lines)
+    if other:
+        result += "\n\n## Other files\n" + "\n".join(f"  {p}" for p in other)
+    return result
+
+
+def _ask_for_context(file_map: str, existing: str | None = None) -> str | None:
+    """Ask the model to produce a .agent_context.md given the file map."""
+    if existing:
+        prompt = (
+            "Below is an updated file map of the repository, followed by the "
+            "existing .agent_context.md.\n\n"
+            "Produce a revised .agent_context.md that:\n"
+            "1. Updates the File Map section verbatim from the new scan below.\n"
+            "2. Preserves and lightly updates the Purpose and Architecture Notes "
+            "sections based on any new/changed/removed files.\n"
+            "Output ONLY the markdown content, starting with '# Repo Context'.\n\n"
+            f"=== NEW FILE MAP ===\n{file_map}\n\n"
+            f"=== EXISTING CONTEXT ===\n{existing}"
+        )
+    else:
+        prompt = (
+            "Below is a file map of a software repository extracted with Python ast.\n"
+            "Write a .agent_context.md with exactly these three sections:\n\n"
+            "# Repo Context\n\n"
+            "## Purpose\n"
+            "<2-4 sentences: what this repo does, its main goal>\n\n"
+            "## Architecture Notes\n"
+            "<bullet points: key modules, how they fit together, important patterns>\n\n"
+            "## File Map\n"
+            "<paste the file map below verbatim>\n\n"
+            "Output ONLY the markdown, no commentary.\n\n"
+            f"{file_map}"
+        )
+
+    msgs = [
+        {"role": "system",  "content": "You are a technical documentation writer."},
+        {"role": "user",    "content": prompt},
+    ]
+    data, err = api_call(msgs, tools=None)
+    if err or not data:
+        return None
+    return data["choices"][0]["message"].get("content", "").strip()
+
+
+def _update_context_from_session(messages: list) -> str | None:
+    """Ask model to revise .agent_context.md based on what happened in this session."""
+    existing = CONTEXT_FILE.read_text() if CONTEXT_FILE.exists() else "(none)"
+    prompt = (
+        "Based on the conversation above, update the .agent_context.md below.\n"
+        "Revise the Purpose and Architecture Notes if anything changed.\n"
+        "Update the File Map only for files that were created or modified.\n"
+        "Output ONLY the full revised markdown, starting with '# Repo Context'.\n\n"
+        f"=== CURRENT .agent_context.md ===\n{existing}"
+    )
+    msgs = list(messages) + [{"role": "user", "content": prompt}]
+    data, err = api_call(msgs, tools=None)
+    if err or not data:
+        return None
+    return data["choices"][0]["message"].get("content", "").strip()
 
 
 # ── Session persistence ───────────────────────────────────────────────────────
@@ -523,7 +742,7 @@ def session_load(path: Path) -> list:
     msgs = data.get("messages", [])
     # Replace system prompt with current one (workdir may have changed)
     if msgs and msgs[0]["role"] == "system":
-        msgs[0]["content"] = SYSTEM_PROMPT
+        msgs[0]["content"] = build_system_prompt()
     return msgs
 
 
@@ -595,7 +814,7 @@ def offer_summarization(messages: list, current_session: list, force: bool = Fal
 
     # New session: system prompt + summary as first assistant message
     new_messages = [
-        {"role": "system",    "content": SYSTEM_PROMPT},
+        {"role": "system",    "content": build_system_prompt()},
         {"role": "assistant", "content": f"[Session summary]\n{summary}"},
     ]
     current_session[0] = None   # will get a new file on next autosave
@@ -606,6 +825,9 @@ def offer_summarization(messages: list, current_session: list, force: bool = Fal
 
 _HELP = """\
 Commands:
+  /init           — scan repo, generate .agent_context.md (injected every session)
+  /update         — revise .agent_context.md based on this session's changes
+  /reinit         — rescan repo + reconcile with existing .agent_context.md
   /clear          — wipe conversation context (start fresh)
   /sessions       — list saved sessions
   /resume [N]     — resume session N from the list (default: last)
@@ -613,24 +835,82 @@ Commands:
   /summarize      — summarize and compress context right now
   exit / quit     — save and exit
 
+.agent_context.md is auto-injected into the system prompt on every session start.
 Context is auto-saved after every turn. When it exceeds ~40k chars
 you will be asked whether to summarize and start a fresh session.
 """
 
 
+def _handle_context_command(cmd: str, messages: list):
+    """/init | /reinit | /update — generate or refresh .agent_context.md."""
+    if cmd in ("/init", "/reinit"):
+        print("[scanning repo…]", flush=True)
+        file_map = scan_repo()
+
+        existing = None
+        if cmd == "/reinit" and CONTEXT_FILE.exists():
+            existing = CONTEXT_FILE.read_text()
+            print("[reconciling with existing context…]", flush=True)
+        else:
+            print("[generating context with AI…]", flush=True)
+
+        content = _ask_for_context(file_map, existing)
+        if not content:
+            print("[failed to generate context — check API]\n")
+            return
+
+        # Ensure it starts with the right header
+        if not content.startswith("# Repo Context"):
+            content = "# Repo Context\n\n" + content
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        content = f"{content}\n\n_Generated: {ts}_\n"
+        CONTEXT_FILE.write_text(content)
+        print(f"[written {CONTEXT_FILE.name} — {len(content)} chars]\n")
+
+    elif cmd == "/update":
+        if not CONTEXT_FILE.exists():
+            print("[no .agent_context.md found — run /init first]\n")
+            return
+        print("[updating context based on this session…]", flush=True)
+        content = _update_context_from_session(messages)
+        if not content:
+            print("[failed — check API]\n")
+            return
+        if not content.startswith("# Repo Context"):
+            content = "# Repo Context\n\n" + content
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        content = f"{content}\n\n_Updated: {ts}_\n"
+        CONTEXT_FILE.write_text(content)
+        print(f"[updated {CONTEXT_FILE.name}]\n")
+
+
+def _refresh_system_msg(messages: list) -> list:
+    """Replace the first system message with a freshly built system prompt."""
+    new_sys = build_system_prompt()
+    if messages and messages[0]["role"] == "system":
+        messages[0]["content"] = new_sys
+    else:
+        messages.insert(0, {"role": "system", "content": new_sys})
+    return messages
+
+
 def run_interactive(resume_path: Path | None = None):
     print(f"microagent  |  workdir: {WORKDIR}  |  model: {MODEL}")
     print(f"base_url: {BASE_URL}")
+    if CONTEXT_FILE.exists():
+        print(f"[context: {CONTEXT_FILE.name} loaded]")
     print("Type /help for commands, 'exit' to quit.\n")
 
     current_session: list[Path | None] = [None]  # mutable ref for autosave
 
     if resume_path:
         messages = session_load(resume_path)
+        messages = _refresh_system_msg(messages)   # inject latest context
         current_session[0] = resume_path
         print(f"[resumed {resume_path.name} — {len(messages)-1} messages in context]\n")
     else:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": build_system_prompt()}]
 
     while True:
         # Show context size hint when it's getting large
@@ -657,8 +937,13 @@ def run_interactive(resume_path: Path | None = None):
             print(_HELP)
             continue
 
+        if user_input in ("/init", "/reinit", "/update"):
+            _handle_context_command(user_input, messages)
+            messages = _refresh_system_msg(messages)
+            continue
+
         if user_input == "/clear":
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages = [{"role": "system", "content": build_system_prompt()}]
             current_session[0] = None
             print("[context cleared]\n")
             continue
@@ -726,7 +1011,7 @@ def run_oneshot(task: str):
 
     worklog_session_start(task)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": build_system_prompt()},
         {"role": "user",   "content": task},
     ]
 
