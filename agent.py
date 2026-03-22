@@ -413,6 +413,11 @@ You can read, create, and edit files, and run basic shell commands.
 Always read a file before editing it.
 Use patch_file for targeted changes; use write_file only for new files or full rewrites.
 Be precise with patch_file — old_str must match the file exactly, including whitespace.
+
+Function signature rule: whenever you add, remove, or rename a parameter in a function
+definition, you MUST use grep to find every call site of that function across the entire
+codebase and update each one. Never leave callers out of sync with the new signature.
+
 When done, summarize what you did."""
 
 
