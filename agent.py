@@ -879,17 +879,23 @@ def offer_summarization(messages: list, current_session: list, force: bool = Fal
 _HELP = """\
 Commands:
   /init           — scan repo, generate .agent_context.md (injected every session)
-  /update         — revise .agent_context.md based on this session's changes
   /reinit         — rescan repo + reconcile with existing .agent_context.md
-  /clear          — wipe conversation context (start fresh)
-  /sessions       — list saved sessions
+  /update         — revise .agent_context.md based on this session's changes
+  /sessions       — list saved sessions with preview
   /resume [N]     — resume session N from the list (default: last)
   /save           — force-save current session now
   /summarize      — summarize and compress context right now
+  /clear          — wipe conversation context (start fresh)
   exit / quit     — save and exit
 
-.agent_context.md is auto-injected into the system prompt on every session start.
-Context is auto-saved after every turn. When it exceeds ~40k chars
+CLI flags (one-shot or interactive):
+  --model MODEL   — override OPENAI_MODEL
+  --url URL       — override OPENAI_BASE_URL
+  --resume [N]    — resume last (or Nth) session at startup
+  --init          — generate .agent_context.md and exit
+
+.agent_context.md is injected into the system prompt on every session start.
+Context auto-saves after every turn. When it exceeds MAX_CONTEXT_CHARS
 you will be asked whether to summarize and start a fresh session.
 """
 
