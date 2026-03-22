@@ -470,34 +470,254 @@ def _run_task(messages: list) -> str | None:
             return text
 
 
-def run_interactive():
+# ── Session persistence ───────────────────────────────────────────────────────
+
+SESSIONS_DIR       = WORKDIR / ".sessions"
+MAX_CONTEXT_CHARS  = 40_000   # ~10k tokens; offer summarization above this
+
+
+def _sessions_dir() -> Path:
+    SESSIONS_DIR.mkdir(exist_ok=True)
+    return SESSIONS_DIR
+
+
+def session_save(messages: list) -> Path:
+    """Write current messages to a timestamped JSON file. Returns path."""
+    d   = _sessions_dir()
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = d / f"session_{ts}.json"
+    payload = {
+        "started":      ts,
+        "last_updated": datetime.now().isoformat(timespec="seconds"),
+        "model":        MODEL,
+        "workdir":      str(WORKDIR),
+        "messages":     messages,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    return path
+
+
+def session_autosave(messages: list, current_path: list):
+    """Overwrite current session file (or create one). current_path is a 1-elem list."""
+    if not current_path[0]:
+        current_path[0] = session_save(messages)
+    else:
+        payload = {
+            "last_updated": datetime.now().isoformat(timespec="seconds"),
+            "model":        MODEL,
+            "workdir":      str(WORKDIR),
+            "messages":     messages,
+        }
+        current_path[0].write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def session_list() -> list[Path]:
+    """Return session files sorted newest-first."""
+    d = _sessions_dir()
+    return sorted(d.glob("session_*.json"), reverse=True)
+
+
+def session_load(path: Path) -> list:
+    """Load messages from a session file."""
+    data = json.loads(path.read_text())
+    msgs = data.get("messages", [])
+    # Replace system prompt with current one (workdir may have changed)
+    if msgs and msgs[0]["role"] == "system":
+        msgs[0]["content"] = SYSTEM_PROMPT
+    return msgs
+
+
+def _context_chars(messages: list) -> int:
+    """Rough character count of all message content."""
+    return sum(
+        len(m.get("content") or "") +
+        sum(len(tc["function"].get("arguments", "")) for tc in m.get("tool_calls") or [])
+        for m in messages
+    )
+
+
+def summarize_session(messages: list) -> str | None:
+    """
+    Ask the model for a compact summary of the conversation so far.
+    Returns the summary string, or None on error.
+    """
+    summary_request = (
+        "Summarize this conversation as concisely as possible. "
+        "Include: files touched, changes made, key decisions, and any open issues. "
+        "This summary will replace the full history in the next session."
+    )
+    slim = [m for m in messages if m["role"] in ("system", "user", "assistant")
+            and not m.get("tool_calls")]   # skip tool noise for summary
+    slim.append({"role": "user", "content": summary_request})
+
+    data, err = api_call(slim, tools=None)
+    if err or not data:
+        return None
+    return data["choices"][0]["message"].get("content", "").strip()
+
+
+def offer_summarization(messages: list, current_session: list, force: bool = False) -> list:
+    """
+    Called when context is large. Asks user whether to summarize and restart.
+    Returns (possibly new) messages list.
+    """
+    chars = _context_chars(messages)
+    if force:
+        print("[summarizing current session…]", flush=True)
+    else:
+        print(
+            f"\n[context is {chars:,} chars (~{chars//4:,} tokens). "
+            f"Summarize and start a fresh session? (y/N)] ",
+            end="", flush=True,
+        )
+        try:
+            answer = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return messages
+        if answer != "y":
+            return messages
+        print("[summarizing…]", flush=True)
+
+    print("[summarizing…]", flush=True)
+    summary = summarize_session(messages)
+    if not summary:
+        print("[summarization failed — continuing with full context]\n")
+        return messages
+
+    # Archive old session before starting fresh
+    session_autosave(messages, current_session)
+    old_name = current_session[0].name if current_session[0] else "previous"
+    print(f"[archived as {old_name}]\n")
+    print("── Summary ─────────────────────────────────────")
+    print(summary)
+    print("─────────────────────────────────────────────────\n")
+
+    # New session: system prompt + summary as first assistant message
+    new_messages = [
+        {"role": "system",    "content": SYSTEM_PROMPT},
+        {"role": "assistant", "content": f"[Session summary]\n{summary}"},
+    ]
+    current_session[0] = None   # will get a new file on next autosave
+    return new_messages
+
+
+# ── Interactive mode ──────────────────────────────────────────────────────────
+
+_HELP = """\
+Commands:
+  /clear          — wipe conversation context (start fresh)
+  /sessions       — list saved sessions
+  /resume [N]     — resume session N from the list (default: last)
+  /save           — force-save current session now
+  /summarize      — summarize and compress context right now
+  exit / quit     — save and exit
+
+Context is auto-saved after every turn. When it exceeds ~40k chars
+you will be asked whether to summarize and start a fresh session.
+"""
+
+
+def run_interactive(resume_path: Path | None = None):
     print(f"microagent  |  workdir: {WORKDIR}  |  model: {MODEL}")
     print(f"base_url: {BASE_URL}")
-    print("Type 'exit' or 'quit' to quit, Ctrl+C to cancel current request.\n")
+    print("Type /help for commands, 'exit' to quit.\n")
+
+    current_session: list[Path | None] = [None]  # mutable ref for autosave
+
+    if resume_path:
+        messages = session_load(resume_path)
+        current_session[0] = resume_path
+        print(f"[resumed {resume_path.name} — {len(messages)-1} messages in context]\n")
+    else:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
+        # Show context size hint when it's getting large
+        n = len(messages) - 1
+        prompt = f"[{n}]> " if n > 10 else "> "
+
         try:
-            task = input("> ").strip()
+            user_input = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
+            session_autosave(messages, current_session)
             return
 
-        if task.lower() in ("exit", "quit"):
-            print("Bye!")
-            return
-        if not task:
+        if not user_input:
             continue
 
-        worklog_session_start(task)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": task},
-        ]
+        if user_input.lower() in ("exit", "quit"):
+            session_autosave(messages, current_session)
+            print(f"[saved {current_session[0].name}]")
+            print("Bye!")
+            return
+
+        if user_input == "/help":
+            print(_HELP)
+            continue
+
+        if user_input == "/clear":
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            current_session[0] = None
+            print("[context cleared]\n")
+            continue
+
+        if user_input == "/save":
+            session_autosave(messages, current_session)
+            print(f"[saved {current_session[0].name}]\n")
+            continue
+
+        if user_input == "/summarize":
+            messages = offer_summarization(messages, current_session, force=True)
+            continue
+
+        if user_input == "/sessions":
+            files = session_list()
+            if not files:
+                print("(no saved sessions)\n")
+            else:
+                for i, f in enumerate(files):
+                    try:
+                        meta = json.loads(f.read_text())
+                        nm   = len([m for m in meta.get("messages", []) if m["role"] != "system"])
+                        ts   = meta.get("last_updated", f.stem)
+                        print(f"  [{i}] {f.name}  {nm} msgs  updated {ts}")
+                    except Exception:
+                        print(f"  [{i}] {f.name}")
+                print()
+            continue
+
+        if user_input.startswith("/resume"):
+            files = session_list()
+            if not files:
+                print("[no sessions to resume]\n")
+                continue
+            parts = user_input.split()
+            idx   = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if idx >= len(files):
+                print(f"[no session {idx}]\n")
+                continue
+            messages        = session_load(files[idx])
+            current_session[0] = files[idx]
+            print(f"[resumed {files[idx].name} — {len(messages)-1} messages]\n")
+            continue
+
+        # Offer summarization when context grows large
+        if _context_chars(messages) > MAX_CONTEXT_CHARS:
+            messages = offer_summarization(messages, current_session)
+
+        messages.append({"role": "user", "content": user_input})
+        worklog_session_start(user_input)
 
         text = _run_task(messages)
+
         if text:
             print(text, flush=True)
             worklog_result(text)
+
+        # Auto-save after every completed turn
+        session_autosave(messages, current_session)
 
 
 def run_oneshot(task: str):
@@ -519,7 +739,27 @@ def run_oneshot(task: str):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        run_oneshot(" ".join(sys.argv[1:]))
+    args = sys.argv[1:]
+
+    # --resume [path|index]
+    if args and args[0] == "--resume":
+        files = session_list()
+        if not files:
+            print("No saved sessions found.")
+            sys.exit(1)
+        if len(args) > 1:
+            ref = args[1]
+            if ref.isdigit():
+                idx = int(ref)
+                resume = files[idx] if idx < len(files) else None
+            else:
+                resume = Path(ref)
+        else:
+            resume = files[0]   # last session
+        run_interactive(resume_path=resume)
+
+    elif args:
+        run_oneshot(" ".join(args))
+
     else:
         run_interactive()
