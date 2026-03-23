@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 microagent — minimal coding agent
-Single file, zero dependencies, OpenAI-compatible API (tool calling).
+Single file, zero dependencies, OpenAI-compatible API (JSON tool parsing).
 
 Usage:
     python agent.py                            # interactive REPL
@@ -13,6 +13,7 @@ import ast as _ast
 import http.client
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -46,10 +47,11 @@ def _load_dotenv():
 
 _load_dotenv()
 
-API_KEY   = os.environ.get("OPENAI_API_KEY", "")
-BASE_URL  = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-MODEL     = os.environ.get("OPENAI_MODEL", "gpt-4o")
-WORKDIR   = Path(os.environ.get("WORKDIR", ".")).resolve()
+API_KEY        = os.environ.get("OPENAI_API_KEY", "")
+BASE_URL       = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+MODEL          = os.environ.get("OPENAI_MODEL", "gpt-4o")
+WORKDIR        = Path(os.environ.get("WORKDIR", ".")).resolve()
+MAX_TOOL_CALLS = int(os.environ.get("MAX_TOOL_CALLS", "50"))
 
 
 # ── Cancellation ─────────────────────────────────────────────────────────────
@@ -73,7 +75,7 @@ signal.signal(signal.SIGINT, _sigint_handler)
 
 # ── HTTP API call ─────────────────────────────────────────────────────────────
 
-def _api_call_impl(messages: list, tools: list) -> tuple[dict | None, str | None]:
+def _api_call_impl(messages: list) -> tuple[dict | None, str | None]:
     """Send POST /v1/chat/completions, return (data, error)."""
     global _current_conn
 
@@ -84,8 +86,6 @@ def _api_call_impl(messages: list, tools: list) -> tuple[dict | None, str | None
     use_ssl  = parsed.scheme == "https"
 
     payload = {"model": MODEL, "messages": messages, "temperature": 0}
-    if tools:
-        payload["tools"] = tools
 
     body    = json.dumps(payload).encode()
     headers = {
@@ -123,13 +123,13 @@ def _api_call_impl(messages: list, tools: list) -> tuple[dict | None, str | None
             pass
 
 
-def api_call(messages: list, tools: list) -> tuple[dict | None, str | None]:
+def api_call(messages: list) -> tuple[dict | None, str | None]:
     """Run API call in a thread so SIGINT can cancel it cleanly."""
     _cancel_event.clear()
     result: list = [None, None]
 
     def _run():
-        result[0], result[1] = _api_call_impl(messages, tools)
+        result[0], result[1] = _api_call_impl(messages)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -229,17 +229,12 @@ def tool_grep(pattern: str, path: str = ".") -> str:
     if err:
         return f"Error: {err}"
     try:
+        exclude_args = [f"--exclude-dir={d}" for d in _SKIP_DIRS]
         res = subprocess.run(
-            ["grep", "-rn", "--", pattern, str(p)],
+            ["grep", "-rn", "--"] + exclude_args + [pattern, str(p)],
             capture_output=True, text=True, timeout=15, cwd=str(WORKDIR),
         )
-        # Filter lines whose path contains a skipped directory segment
-        lines = res.stdout.splitlines()
-        filtered = [
-            l for l in lines
-            if not any(f"/{d}/" in l or l.startswith(f"{d}/") for d in _SKIP_DIRS)
-        ]
-        out = "\n".join(filtered) if filtered else (res.stderr.strip() or "(no matches)")
+        out = res.stdout or res.stderr.strip() or "(no matches)"
         # Strip absolute WORKDIR prefix so model gets relative paths
         out = out.replace(str(WORKDIR) + "/", "")
         if len(out) > 20000:
@@ -316,97 +311,59 @@ TOOL_HANDLERS = {
     "shell":      lambda a: tool_shell(a["command"]),
 }
 
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a file relative to WORKDIR. Returns content (max 50000 chars).",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "File path relative to WORKDIR"}},
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create or overwrite a file. Creates parent directories automatically.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path":    {"type": "string", "description": "File path relative to WORKDIR"},
-                    "content": {"type": "string", "description": "Full file content"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "patch_file",
-            "description": (
-                "Replace exactly one occurrence of old_str with new_str. "
-                "Fails if old_str is missing or appears multiple times. "
-                "Use new_str='' to delete a fragment."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path":    {"type": "string", "description": "File path relative to WORKDIR"},
-                    "old_str": {"type": "string", "description": "Exact string to find and replace"},
-                    "new_str": {"type": "string", "description": "Replacement string (empty string to delete)"},
-                },
-                "required": ["path", "old_str", "new_str"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "ls",
-            "description": "List files and directories (non-recursive). Directories are suffixed with /.",
-            "parameters": {
-                "type": "object",
-                "properties": {"path": {"type": "string", "description": "Directory path (default: .)"}},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "grep",
-            "description": "Recursive text search. Returns filename:line:content matches.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
-                    "path":    {"type": "string", "description": "Directory or file to search (default: .)"},
-                },
-                "required": ["pattern"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "shell",
-            "description": (
-                "Run a whitelisted shell command. "
-                f"Allowed: {', '.join(sorted(SHELL_WHITELIST))}."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
-                "required": ["command"],
-            },
-        },
-    },
-]
+# Tools are described in the system prompt; the model outputs JSON to invoke them.
+TOOLS_PROMPT = f"""
+## Tools
+
+To call a tool, output ONLY a JSON object — no text before or after it:
+{{"tool": "TOOL_NAME", "args": {{"param": "value"}}}}
+
+After receiving the result you may call another tool or give your final answer as plain text.
+
+Available tools:
+
+read_file   — Read a file (max 50k chars)
+  args: path (string, required)
+
+write_file  — Create or overwrite a file (max 2 MB)
+  args: path (string, required), content (string, required)
+
+patch_file  — Replace exactly one occurrence of old_str with new_str; use new_str="" to delete
+  args: path (string, required), old_str (string, required), new_str (string, required)
+
+ls          — List directory contents (non-recursive)
+  args: path (string, optional, default ".")
+
+grep        — Recursive text search; returns file:line:content matches
+  args: pattern (string, required), path (string, optional, default ".")
+
+shell       — Run a whitelisted command: {' '.join(sorted(SHELL_WHITELIST))}
+  args: command (string, required)
+"""
+
+
+def _parse_tool_call(content: str) -> dict | None:
+    """
+    Try to extract a tool call from model output.
+    Accepts bare JSON or a ```json ... ``` fenced block.
+    Returns {{"tool": str, "args": dict}} or None.
+    """
+    candidates = [content.strip()]
+
+    # Also try to extract from a fenced code block
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+    if m:
+        candidates.append(m.group(1).strip())
+
+    for text in candidates:
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and "tool" in obj:
+                return {"tool": obj["tool"], "args": obj.get("args", {})}
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return None
 
 
 # ── Worklog ───────────────────────────────────────────────────────────────────
@@ -468,7 +425,6 @@ def load_repo_context() -> str:
 
 _SYSTEM_BASE = f"""You are a coding agent working in the directory: {WORKDIR}
 
-You can read, create, and edit files, and run basic shell commands.
 Always read a file before editing it.
 Use patch_file for targeted changes; use write_file only for new files or full rewrites.
 Be precise with patch_file — old_str must match the file exactly, including whitespace.
@@ -477,7 +433,8 @@ Function signature rule: whenever you add, remove, or rename a parameter in a fu
 definition, you MUST use grep to find every call site of that function across the entire
 codebase and update each one. Never leave callers out of sync with the new signature.
 
-When done, summarize what you did."""
+When done, respond with plain text summarizing what you did.
+{TOOLS_PROMPT}"""
 
 
 def build_system_prompt() -> str:
@@ -492,10 +449,13 @@ SYSTEM_PROMPT = build_system_prompt()
 def _run_task(messages: list) -> str | None:
     """
     Run the agentic loop for the current messages list.
+    The model signals tool calls by outputting a JSON object; we parse and execute it.
     Returns the final assistant text, or None on cancellation/error.
     """
+    tool_call_count = 0
+
     while True:
-        data, err = api_call(messages, TOOLS_SCHEMA)
+        data, err = api_call(messages)
 
         if err == "cancelled":
             return None
@@ -504,54 +464,49 @@ def _run_task(messages: list) -> str | None:
             print(f"[API error] {err}", file=sys.stderr)
             return None
 
-        choice = data["choices"][0]
-        msg    = choice["message"]
+        choice  = data["choices"][0]
+        msg     = choice["message"]
+        content = msg.get("content") or ""
         messages.append(msg)
 
-        tool_calls = msg.get("tool_calls")
+        tc = _parse_tool_call(content)
 
-        if tool_calls:
-            for tc in tool_calls:
-                name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
-                    args = {}
+        if tc and tool_call_count < MAX_TOOL_CALLS:
+            tool_call_count += 1
+            name = tc["tool"]
+            args = tc["args"]
 
-                # Brief display label
-                label = args.get("path") or args.get("command") or args.get("pattern") or ""
-                print(f"⚡ {name} {label}", end="", flush=True)
+            label = args.get("path") or args.get("command") or args.get("pattern") or ""
+            print(f"⚡ {name} {label}", end="", flush=True)
 
-                handler = TOOL_HANDLERS.get(name)
-                try:
-                    result = handler(args) if handler else f"Error: unknown tool {name}"
-                except KeyError as e:
-                    result = f"Error: missing required argument {e}"
-                except Exception as e:
-                    result = f"Error: {e}"
+            handler = TOOL_HANDLERS.get(name)
+            try:
+                result = handler(args) if handler else f"Error: unknown tool {name!r}"
+            except KeyError as e:
+                result = f"Error: missing required argument {e}"
+            except Exception as e:
+                result = f"Error: {e}"
 
-                # Show brief inline result
-                first_line = result.splitlines()[0] if result else ""
-                if result.startswith("Error"):
-                    print(f"  → {first_line}", flush=True)
-                elif result.startswith("OK"):
-                    print(f"  → {first_line}", flush=True)
-                else:
-                    n = len(result)
-                    lines = result.count("\n") + 1
-                    print(f"  → {lines} lines, {n} chars", flush=True)
+            # Inline result summary
+            first_line = result.splitlines()[0] if result else ""
+            if result.startswith("Error") or result.startswith("OK"):
+                print(f"  → {first_line}", flush=True)
+            else:
+                print(f"  → {result.count(chr(10)) + 1} lines, {len(result)} chars", flush=True)
 
-                worklog_tool(name, args, result)
+            worklog_tool(name, args, result)
 
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc["id"],
-                    "content":      result,
-                })
+            messages.append({
+                "role":    "user",
+                "content": f"[tool result: {name}]\n{result}",
+            })
+
+        elif tc and tool_call_count >= MAX_TOOL_CALLS:
+            print(f"[max tool calls ({MAX_TOOL_CALLS}) reached — stopping]", file=sys.stderr)
+            return content
 
         else:
-            text = msg.get("content") or ""
-            return text
+            return content
 
 
 # ── Repo context (.agent_context.md) ─────────────────────────────────────────
@@ -726,7 +681,7 @@ def _ask_for_context(file_map: str, existing: str | None = None) -> str | None:
         {"role": "system",  "content": "You are a technical documentation writer."},
         {"role": "user",    "content": prompt},
     ]
-    data, err = api_call(msgs, tools=None)
+    data, err = api_call(msgs)
     if err or not data:
         return None
     return data["choices"][0]["message"].get("content", "").strip()
@@ -743,7 +698,7 @@ def _update_context_from_session(messages: list) -> str | None:
         f"=== CURRENT .agent_context.md ===\n{existing}"
     )
     msgs = list(messages) + [{"role": "user", "content": prompt}]
-    data, err = api_call(msgs, tools=None)
+    data, err = api_call(msgs)
     if err or not data:
         return None
     return data["choices"][0]["message"].get("content", "").strip()
@@ -831,11 +786,7 @@ def session_load(path: Path) -> list:
 
 def _context_chars(messages: list) -> int:
     """Rough character count of all message content."""
-    return sum(
-        len(m.get("content") or "") +
-        sum(len(tc["function"].get("arguments", "")) for tc in m.get("tool_calls") or [])
-        for m in messages
-    )
+    return sum(len(m.get("content") or "") for m in messages)
 
 
 def summarize_session(messages: list) -> str | None:
@@ -848,11 +799,10 @@ def summarize_session(messages: list) -> str | None:
         "Include: files touched, changes made, key decisions, and any open issues. "
         "This summary will replace the full history in the next session."
     )
-    slim = [m for m in messages if m["role"] in ("system", "user", "assistant")
-            and not m.get("tool_calls")]   # skip tool noise for summary
+    slim = [m for m in messages if m["role"] in ("system", "user", "assistant")]
     slim.append({"role": "user", "content": summary_request})
 
-    data, err = api_call(slim, tools=None)
+    data, err = api_call(slim)
     if err or not data:
         return None
     return data["choices"][0]["message"].get("content", "").strip()
