@@ -225,10 +225,18 @@ def tool_grep(pattern: str, path: str = ".") -> str:
         return f"Error: {err}"
     try:
         res = subprocess.run(
-            ["grep", "-rn", "--", pattern, str(p)],   # "--" prevents pattern-as-flag
+            ["grep", "-rn", "--", pattern, str(p)],
             capture_output=True, text=True, timeout=15, cwd=str(WORKDIR),
         )
-        out = res.stdout or res.stderr or "(no matches)"
+        # Filter lines whose path contains a skipped directory segment
+        lines = res.stdout.splitlines()
+        filtered = [
+            l for l in lines
+            if not any(f"/{d}/" in l or l.startswith(f"{d}/") for d in _SKIP_DIRS)
+        ]
+        out = "\n".join(filtered) if filtered else (res.stderr.strip() or "(no matches)")
+        # Strip absolute WORKDIR prefix so model gets relative paths
+        out = out.replace(str(WORKDIR) + "/", "")
         if len(out) > 20000:
             out = out[:20000] + "\n... [truncated]"
         return out
@@ -404,9 +412,21 @@ def _wlog(text: str):
     with open(WORKLOG, "a") as f:
         f.write(text)
 
-def worklog_session_start(task: str):
+def worklog_session_open(mode: str, resumed_from: "Path | None" = None):
+    """Write the opening header once per agent run."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    _wlog(f"\n## Session {ts}\n\n**Task:** {task}\n\n")
+    header = f"\n## Session {ts}  [{mode} | model: {MODEL}]\n"
+    if resumed_from:
+        header += f"_Resumed: {resumed_from.name}_\n"
+    header += "\n"
+    _wlog(header)
+
+def worklog_session_close():
+    _wlog("---\n")
+
+def worklog_turn(task: str):
+    """Log one user turn inside an open session."""
+    _wlog(f"**Turn:** {task}\n\n")
 
 def worklog_tool(name: str, args: dict, result: str):
     brief_args = ", ".join(
@@ -417,7 +437,12 @@ def worklog_tool(name: str, args: dict, result: str):
     _wlog(f"- `{name}({brief_args})` → {summary}\n")
 
 def worklog_result(summary: str):
-    _wlog(f"\n**Result:** {summary[:300]}\n\n---\n")
+    _wlog(f"\n→ {summary[:300]}\n\n")
+
+# kept for one-shot compatibility
+def worklog_session_start(task: str):
+    worklog_session_open("one-shot")
+    worklog_turn(task)
 
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
@@ -968,8 +993,10 @@ def run_interactive(resume_path: Path | None = None):
         messages = _refresh_system_msg(messages)   # inject latest context
         current_session[0] = resume_path
         print(f"[resumed {resume_path.name} — {len(messages)-1} messages in context]\n")
+        worklog_session_open("interactive", resumed_from=resume_path)
     else:
         messages = [{"role": "system", "content": build_system_prompt()}]
+        worklog_session_open("interactive")
 
     while True:
         # Show context size hint when it's getting large
@@ -981,6 +1008,7 @@ def run_interactive(resume_path: Path | None = None):
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             session_autosave(messages, current_session)
+            worklog_session_close()
             return
 
         if not user_input:
@@ -988,6 +1016,7 @@ def run_interactive(resume_path: Path | None = None):
 
         if user_input.lower() in ("exit", "quit"):
             session_autosave(messages, current_session)
+            worklog_session_close()
             print(f"[saved {current_session[0].name}]")
             print("Bye!")
             return
@@ -1053,7 +1082,7 @@ def run_interactive(resume_path: Path | None = None):
             messages = offer_summarization(messages, current_session)
 
         messages.append({"role": "user", "content": user_input})
-        worklog_session_start(user_input)
+        worklog_turn(user_input)
 
         text = _run_task(messages)
 
@@ -1069,7 +1098,8 @@ def run_oneshot(task: str):
     print(f"microagent  |  workdir: {WORKDIR}  |  model: {MODEL}")
     print(f"base_url: {BASE_URL}\n", flush=True)
 
-    worklog_session_start(task)
+    worklog_session_open("one-shot")
+    worklog_turn(task)
     messages = [
         {"role": "system", "content": build_system_prompt()},
         {"role": "user",   "content": task},
@@ -1079,6 +1109,7 @@ def run_oneshot(task: str):
     if text:
         print(text, flush=True)
         worklog_result(text)
+    worklog_session_close()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
