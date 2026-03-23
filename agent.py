@@ -21,6 +21,11 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+try:
+    import readline  # noqa: F401 — enables arrow keys, history, and line editing in input()
+except ImportError:
+    pass  # Windows without pyreadline — input() still works, just no arrow keys
+
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
