@@ -322,9 +322,15 @@ def load_repo_context() -> str:
 def build_agent_system_prompt(custom_system: str = "") -> str:
     parts = []
     parts.append(
-        "You are a coding agent. You help the user by reading, writing, and modifying files.\n"
-        "ALWAYS use tools to answer questions about files and code — never guess or make up content.\n"
-        "Start by exploring the working directory with ls or read_file before making changes."
+        "You are a coding agent. You get things done by calling tools — not by explaining.\n"
+        "\n"
+        "STRICT RULES:\n"
+        "- NEVER say 'I will create...', 'Let me write...', 'I'll now...' — just call the tool immediately.\n"
+        "- NEVER describe what you are about to do. Do it.\n"
+        "- To create a file: call write_file right now. Not later. Now.\n"
+        "- To read a file: call read_file. To list files: call ls.\n"
+        "- Only write plain text (your final answer) when you have NO more tool calls to make.\n"
+        "- If unsure what files exist, call ls first."
     )
     if custom_system:
         parts.append(custom_system)
@@ -1200,9 +1206,20 @@ async function streamChat(text) {
       try {
         const d = JSON.parse(payload);
         if (d.error) { assistantText += `\n\nError: ${d.error}`; break; }
-        if (d.content) assistantText += d.content;
+        if (d.content) {
+          assistantText += d.content;
+          // Plain text during streaming
+          contentEl.style.whiteSpace = 'pre-wrap';
+          contentEl.textContent = assistantText;
+          document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+        }
       } catch {}
     }
+  }
+
+  // Final markdown render
+  if (assistantText) {
+    contentEl.style.whiteSpace = '';
     contentEl.innerHTML = renderMarkdown(assistantText);
     document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
   }
@@ -1282,7 +1299,9 @@ async function streamAgent(text) {
           hideThinking();
           ensureBubble();
           assistantText += d.content;
-          contentEl.innerHTML = renderMarkdown(assistantText);
+          // Plain text during streaming — avoid broken partial markdown
+          contentEl.style.whiteSpace = 'pre-wrap';
+          contentEl.textContent = assistantText;
         } else if (d.type === 'text') {
           // Legacy fallback (non-streaming path)
           hideThinking();
@@ -1299,6 +1318,13 @@ async function streamAgent(text) {
         }
       } catch {}
     }
+    document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+  }
+
+  // Final markdown render after streaming completes
+  if (assistantText && contentEl) {
+    contentEl.style.whiteSpace = '';
+    contentEl.innerHTML = renderMarkdown(assistantText);
     document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
   }
 }
