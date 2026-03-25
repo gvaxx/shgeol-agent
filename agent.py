@@ -67,18 +67,19 @@ _SHELL_META = set(";&|`$(){}><\n\\!")
 
 # ── Path safety ──────────────────────────────────────────────────────────────
 
-def safe_path(rel: str) -> Path:
-    """Resolve *rel* relative to WORKDIR.  Block directory traversal."""
-    resolved = (WORKDIR / rel).resolve()
-    if not (str(resolved) == str(WORKDIR) or str(resolved).startswith(str(WORKDIR) + os.sep)):
+def safe_path(rel: str, workdir: Path = None) -> Path:
+    """Resolve *rel* relative to workdir (default: global WORKDIR). Block directory traversal."""
+    wd = workdir if workdir is not None else WORKDIR
+    resolved = (wd / rel).resolve()
+    if not (str(resolved) == str(wd) or str(resolved).startswith(str(wd) + os.sep)):
         raise ValueError(f"Path escapes workdir: {rel}")
     return resolved
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 
-def tool_read_file(path: str) -> str:
-    p = safe_path(path)
+def tool_read_file(path: str, workdir: Path = None) -> str:
+    p = safe_path(path, workdir)
     if not p.is_file():
         return f"ERROR: not a file: {path}"
     content = p.read_text(errors="replace")
@@ -87,17 +88,17 @@ def tool_read_file(path: str) -> str:
     return content
 
 
-def tool_write_file(path: str, content: str) -> str:
+def tool_write_file(path: str, content: str, workdir: Path = None) -> str:
     if len(content) > 2_000_000:
         return "ERROR: content exceeds 2MB limit"
-    p = safe_path(path)
+    p = safe_path(path, workdir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
     return f"OK: wrote {len(content)} chars to {path}"
 
 
-def tool_patch_file(path: str, old_str: str, new_str: str) -> str:
-    p = safe_path(path)
+def tool_patch_file(path: str, old_str: str, new_str: str, workdir: Path = None) -> str:
+    p = safe_path(path, workdir)
     if not p.is_file():
         return f"ERROR: not a file: {path}"
     text = p.read_text(errors="replace")
@@ -111,8 +112,8 @@ def tool_patch_file(path: str, old_str: str, new_str: str) -> str:
     return f"OK: patched {path}"
 
 
-def tool_ls(path: str = ".") -> str:
-    p = safe_path(path)
+def tool_ls(path: str = ".", workdir: Path = None) -> str:
+    p = safe_path(path, workdir)
     if not p.is_dir():
         return f"ERROR: not a directory: {path}"
     entries = sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
@@ -124,8 +125,8 @@ def tool_ls(path: str = ".") -> str:
     return "\n".join(lines) if lines else "(empty directory)"
 
 
-def tool_grep(pattern: str, path: str = ".") -> str:
-    p = safe_path(path)
+def tool_grep(pattern: str, path: str = ".", workdir: Path = None) -> str:
+    p = safe_path(path, workdir)
     exclude_args = []
     for d in _SKIP_DIRS:
         exclude_args.extend(["--exclude-dir", d])
@@ -135,7 +136,7 @@ def tool_grep(pattern: str, path: str = ".") -> str:
     except subprocess.TimeoutExpired:
         return "ERROR: grep timed out after 30s"
     output = result.stdout
-    workdir_prefix = str(WORKDIR) + os.sep
+    workdir_prefix = str(workdir or WORKDIR) + os.sep
     output = output.replace(workdir_prefix, "")
     lines = output.strip().split("\n")
     if len(lines) > 200:
@@ -144,7 +145,7 @@ def tool_grep(pattern: str, path: str = ".") -> str:
     return "\n".join(lines) if lines[0] else "(no matches)"
 
 
-def tool_shell(command: str) -> str:
+def tool_shell(command: str, workdir: Path = None) -> str:
     if any(ch in command for ch in _SHELL_META):
         return "ERROR: shell metacharacters are not allowed"
     try:
@@ -155,13 +156,14 @@ def tool_shell(command: str) -> str:
         return "ERROR: empty command"
     if parts[0] not in _SHELL_WHITELIST:
         return f"ERROR: command '{parts[0]}' is not in the whitelist: {', '.join(sorted(_SHELL_WHITELIST))}"
+    wd = workdir or WORKDIR
     for arg in parts[1:]:
         if arg.startswith("/"):
             arg_path = Path(arg).resolve()
-            if not (str(arg_path) == str(WORKDIR) or str(arg_path).startswith(str(WORKDIR) + os.sep)):
+            if not (str(arg_path) == str(wd) or str(arg_path).startswith(str(wd) + os.sep)):
                 return f"ERROR: absolute path outside WORKDIR: {arg}"
     try:
-        result = subprocess.run(parts, capture_output=True, text=True, timeout=30, cwd=str(WORKDIR))
+        result = subprocess.run(parts, capture_output=True, text=True, timeout=30, cwd=str(wd))
     except subprocess.TimeoutExpired:
         return "ERROR: command timed out after 30s"
     output = (result.stdout + result.stderr).strip()
@@ -170,14 +172,16 @@ def tool_shell(command: str) -> str:
     return output if output else "(no output)"
 
 
-TOOL_HANDLERS = {
-    "read_file":  lambda args: tool_read_file(args["path"]),
-    "write_file": lambda args: tool_write_file(args["path"], args["content"]),
-    "patch_file": lambda args: tool_patch_file(args["path"], args["old_str"], args["new_str"]),
-    "ls":         lambda args: tool_ls(args.get("path", ".")),
-    "grep":       lambda args: tool_grep(args["pattern"], args.get("path", ".")),
-    "shell":      lambda args: tool_shell(args["command"]),
-}
+def make_tool_handlers(workdir: Path = None):
+    wd = workdir or WORKDIR
+    return {
+        "read_file":  lambda args: tool_read_file(args["path"], wd),
+        "write_file": lambda args: tool_write_file(args["path"], args["content"], wd),
+        "patch_file": lambda args: tool_patch_file(args["path"], args["old_str"], args["new_str"], wd),
+        "ls":         lambda args: tool_ls(args.get("path", "."), wd),
+        "grep":       lambda args: tool_grep(args["pattern"], args.get("path", "."), wd),
+        "shell":      lambda args: tool_shell(args["command"], wd),
+    }
 
 
 def get_tools_prompt() -> str:
@@ -319,7 +323,7 @@ def load_repo_context() -> str:
     return ""
 
 
-def build_agent_system_prompt(custom_system: str = "") -> str:
+def build_agent_system_prompt(custom_system: str = "", workdir: Path = None) -> str:
     parts = []
     parts.append(
         "You are a coding agent. You get things done by calling tools — not by explaining.\n"
@@ -338,7 +342,7 @@ def build_agent_system_prompt(custom_system: str = "") -> str:
     ctx = load_repo_context()
     if ctx:
         parts.append(f"## Project context (.agent_context.md)\n{ctx}")
-    parts.append(f"Working directory: {WORKDIR}")
+    parts.append(f"Working directory: {workdir or WORKDIR}")
     return "\n\n".join(parts)
 
 
@@ -425,11 +429,21 @@ async def post_settings(req: Request):
 # ── Routes: Chats ────────────────────────────────────────────────────────────
 
 @app.get("/api/chats")
-async def list_chats():
+async def list_chats(mode: str = None):
     data = load_data()
     chats = []
     for cid, chat in data["chats"].items():
-        chats.append({"id": cid, "title": chat["title"], "created_at": chat["created_at"], "updated_at": chat["updated_at"]})
+        chat_mode = chat.get("mode", "chat")
+        if mode and chat_mode != mode:
+            continue
+        chats.append({
+            "id": cid,
+            "title": chat["title"],
+            "mode": chat_mode,
+            "workdir": chat.get("workdir", ""),
+            "created_at": chat["created_at"],
+            "updated_at": chat["updated_at"],
+        })
     chats.sort(key=lambda c: c["updated_at"], reverse=True)
     return JSONResponse(chats)
 
@@ -440,14 +454,19 @@ async def create_chat(req: Request):
     data = load_data()
     cid = str(uuid.uuid4())[:8]
     now = datetime.now(timezone.utc).isoformat()
-    data["chats"][cid] = {
+    chat_mode = body.get("mode", "chat")
+    chat_entry = {
         "title": body.get("title", "Новый чат"),
+        "mode": chat_mode,
         "created_at": now,
         "updated_at": now,
         "messages": [],
     }
+    if chat_mode == "code":
+        chat_entry["workdir"] = body.get("workdir") or str(WORKDIR)
+    data["chats"][cid] = chat_entry
     save_data(data)
-    return JSONResponse({"id": cid, "title": data["chats"][cid]["title"]})
+    return JSONResponse({"id": cid, "title": chat_entry["title"], "mode": chat_mode, "workdir": chat_entry.get("workdir", "")})
 
 
 @app.put("/api/chats/{chat_id}")
@@ -560,14 +579,22 @@ async def agent_run(req: Request):
             from openai import OpenAI
             client = OpenAI(base_url=base_url, api_key=api_key)
 
-            system_prompt = build_agent_system_prompt(settings.get("agent_extra_prompt", ""))
-
             # Load conversation history
             data = load_data()
             history_msgs = []
             if chat_id and chat_id in data["chats"]:
                 for m in data["chats"][chat_id]["messages"]:
                     history_msgs.append({"role": m["role"], "content": m["content"]})
+
+            # Get workdir for this chat (locked at creation time)
+            chat_workdir = WORKDIR
+            if chat_id and chat_id in data["chats"]:
+                stored_wd = data["chats"][chat_id].get("workdir")
+                if stored_wd:
+                    chat_workdir = Path(stored_wd).resolve()
+
+            tool_handlers = make_tool_handlers(chat_workdir)
+            system_prompt = build_agent_system_prompt(settings.get("agent_extra_prompt", ""), chat_workdir)
 
             api_messages = [{"role": "system", "content": system_prompt}]
             api_messages.extend(history_msgs)
@@ -633,7 +660,7 @@ async def agent_run(req: Request):
                 tool_name = tc["tool"]
                 tool_args = tc["args"]
 
-                handler = TOOL_HANDLERS.get(tool_name)
+                handler = tool_handlers.get(tool_name)
                 if handler is None:
                     result = f"ERROR: unknown tool '{tool_name}'"
                 else:
@@ -772,6 +799,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .chat-item .chat-delete{display:none;background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:0 4px;flex-shrink:0}
 .chat-item:hover .chat-delete{display:block}
 .chat-item .chat-delete:hover{color:var(--danger)}
+.chat-workdir{font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:1px;overflow:hidden;text-overflow:ellipsis}
 
 /* Main */
 .main{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -954,7 +982,7 @@ function applySettings() {
   document.getElementById('sMaxTokens').value = S.settings.max_tokens ?? 4096;
   document.getElementById('sWorkdir').value = S.settings.workdir || '';
   document.getElementById('modelBadge').textContent = S.settings.model || 'gpt-4o';
-  setMode(S.settings.mode || 'chat');
+  setMode(S.settings.mode || 'chat', true);
 }
 
 function getSettings() {
@@ -991,12 +1019,18 @@ document.querySelectorAll('.settings-panel input, .settings-panel textarea').for
 });
 
 // ── Mode toggle ──
-function setMode(mode) {
+function setMode(mode, silent) {
+  const changed = S.mode !== mode;
   S.mode = mode;
   document.getElementById('btnChat').classList.toggle('active', mode === 'chat');
   document.getElementById('btnCode').classList.toggle('active', mode === 'code');
   document.getElementById('agentSection').style.display = mode === 'code' ? 'block' : 'none';
   document.getElementById('chatSystemPromptRow').style.display = mode === 'chat' ? 'block' : 'none';
+  if (changed && !silent) {
+    S.currentChat = null;
+    document.getElementById('messages').innerHTML = '<div class="empty-state">Start a new conversation</div>';
+    loadChats();
+  }
 }
 
 // ── Sidebar ──
@@ -1010,7 +1044,7 @@ function toggleSettings() {
 
 // ── Chats ──
 async function loadChats() {
-  const r = await fetch('/api/chats');
+  const r = await fetch(`/api/chats?mode=${S.mode}`);
   S.chats = await r.json();
   renderChatList();
 }
@@ -1021,7 +1055,8 @@ function renderChatList() {
   for (const c of S.chats) {
     const d = document.createElement('div');
     d.className = 'chat-item' + (S.currentChat === c.id ? ' active' : '');
-    d.innerHTML = `<span class="chat-title">${esc(c.title)}</span><button class="chat-delete" onclick="event.stopPropagation();deleteChat('${c.id}')">&times;</button>`;
+    const wdLabel = (c.mode === 'code' && c.workdir) ? `<div class="chat-workdir">${esc(c.workdir.split('/').pop() || c.workdir)}</div>` : '';
+    d.innerHTML = `<span class="chat-title">${esc(c.title)}${wdLabel}</span><button class="chat-delete" onclick="event.stopPropagation();deleteChat('${c.id}')">&times;</button>`;
     d.onclick = () => openChat(c.id);
     d.ondblclick = () => renameChat(c.id, c.title);
     el.appendChild(d);
@@ -1029,7 +1064,10 @@ function renderChatList() {
 }
 
 async function newChat() {
-  const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+  const settings = getSettings();
+  const body = {mode: S.mode};
+  if (S.mode === 'code') body.workdir = settings.workdir || '';
+  const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   const c = await r.json();
   await loadChats();
   openChat(c.id);
@@ -1138,7 +1176,10 @@ async function sendMessage() {
 
   // Ensure we have a chat
   if (!S.currentChat) {
-    const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+    const settings = getSettings();
+    const body = {mode: S.mode};
+    if (S.mode === 'code') body.workdir = settings.workdir || '';
+    const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     const c = await r.json();
     S.currentChat = c.id;
     await loadChats();
