@@ -1,1117 +1,1285 @@
 #!/usr/bin/env python3
 """
-microagent — minimal coding agent
-Single file, zero dependencies, OpenAI-compatible API (JSON tool parsing).
+agent.py — unified LLM chat + coding agent web application.
 
-Usage:
-    python agent.py                            # interactive REPL
-    python agent.py "add error handling"       # one-shot
-    WORKDIR=/path/to/project python agent.py   # specify working directory
+Launch:
+    python agent.py --work-dir /path/to/project --port 8080
 """
 
+import argparse
 import ast as _ast
-import http.client
 import json
 import os
 import re
-import signal
+import shlex
 import subprocess
 import sys
 import threading
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
-
-try:
-    import readline  # noqa: F401 — enables arrow keys, history, and line editing in input()
-except ImportError:
-    pass  # Windows without pyreadline — input() still works, just no arrow keys
-
+from queue import Queue
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
 def _load_dotenv():
-    env_file = Path(".env")
-    if not env_file.exists():
-        return
-    with open(env_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key = key.strip()
-            val = val.strip().strip('"').strip("'")
-            if key not in os.environ:
-                os.environ[key] = val
+    for env_file in (Path(__file__).resolve().parent / ".env", Path(".env")):
+        if not env_file.exists():
+            continue
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key not in os.environ:
+                    os.environ[key] = val
+        break
 
 _load_dotenv()
 
-API_KEY        = os.environ.get("OPENAI_API_KEY", "")
-BASE_URL       = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-MODEL          = os.environ.get("OPENAI_MODEL", "gpt-4o")
-WORKDIR        = Path(os.environ.get("WORKDIR", ".")).resolve()
-MAX_TOOL_CALLS = int(os.environ.get("MAX_TOOL_CALLS", "50"))
+WORKDIR: Path = Path(os.environ.get("WORKDIR", ".")).resolve()
+MAX_TOOL_CALLS: int = int(os.environ.get("MAX_TOOL_CALLS", "50"))
+AGENT_DATA_PATH: Path = Path(
+    os.environ.get("AGENT_DATA_PATH", str(Path(__file__).resolve().parent / "agent_data.json"))
+)
+
+_SKIP_DIRS = {
+    ".git", "__pycache__", "venv", ".venv", "node_modules",
+    "dist", "build", ".tox", ".mypy_cache", ".sessions",
+    ".egg-info", ".eggs", ".pytest_cache", ".ruff_cache",
+}
+
+_BINARY_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+    ".mp3", ".mp4", ".wav", ".ogg", ".flac",
+    ".zip", ".gz", ".tar", ".bz2", ".xz", ".7z", ".rar",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+    ".pyc", ".pyo", ".so", ".dylib", ".dll", ".exe",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".sqlite", ".db", ".sqlite3",
+}
+
+_SHELL_WHITELIST = {"find", "wc", "head", "tail", "sort", "uniq", "diff", "echo", "pwd", "date"}
+_SHELL_META = set(";&|`$(){}><\n\\!")
+
+# ── Path safety ──────────────────────────────────────────────────────────────
+
+def safe_path(rel: str) -> Path:
+    """Resolve *rel* relative to WORKDIR.  Block directory traversal."""
+    resolved = (WORKDIR / rel).resolve()
+    if not (str(resolved) == str(WORKDIR) or str(resolved).startswith(str(WORKDIR) + os.sep)):
+        raise ValueError(f"Path escapes workdir: {rel}")
+    return resolved
 
 
-# ── Cancellation ─────────────────────────────────────────────────────────────
-
-_cancel_event = threading.Event()
-_current_conn: http.client.HTTPConnection | None = None
-
-def _sigint_handler(sig, frame):
-    global _current_conn
-    _cancel_event.set()
-    conn = _current_conn
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    print("\n[interrupted]", flush=True)
-
-signal.signal(signal.SIGINT, _sigint_handler)
-
-
-# ── HTTP API call ─────────────────────────────────────────────────────────────
-
-def _api_call_impl(messages: list) -> tuple[dict | None, str | None]:
-    """Send POST /v1/chat/completions, return (data, error)."""
-    global _current_conn
-
-    parsed   = urlparse(BASE_URL)
-    host     = parsed.hostname
-    port     = parsed.port
-    path     = parsed.path.rstrip("/") + "/chat/completions"
-    use_ssl  = parsed.scheme == "https"
-
-    payload = {"model": MODEL, "messages": messages, "temperature": 0}
-
-    body    = json.dumps(payload).encode()
-    headers = {
-        "Content-Type":  "application/json",
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Length": str(len(body)),
-    }
-
-    if use_ssl:
-        import ssl
-        ctx  = ssl.create_default_context()
-        conn = http.client.HTTPSConnection(host, port or 443, context=ctx, timeout=300)
-    else:
-        conn = http.client.HTTPConnection(host, port or 80, timeout=300)
-
-    _current_conn = conn
-    try:
-        conn.request("POST", path, body=body, headers=headers)
-        resp = conn.getresponse()
-        raw  = resp.read().decode()
-        if resp.status != 200:
-            return None, f"HTTP {resp.status}: {raw[:500]}"
-        return json.loads(raw), None
-    except OSError as e:
-        if _cancel_event.is_set():
-            return None, "cancelled"
-        return None, f"Connection error: {e}"
-    except json.JSONDecodeError as e:
-        return None, f"JSON parse error: {e}"
-    finally:
-        _current_conn = None
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def api_call(messages: list) -> tuple[dict | None, str | None]:
-    """Run API call in a thread so SIGINT can cancel it cleanly."""
-    _cancel_event.clear()
-    result: list = [None, None]
-
-    def _run():
-        result[0], result[1] = _api_call_impl(messages)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    while t.is_alive():
-        t.join(timeout=0.1)
-        if _cancel_event.is_set():
-            t.join(timeout=3)
-            return None, "cancelled"
-
-    return result[0], result[1]
-
-
-# ── Path safety ───────────────────────────────────────────────────────────────
-
-def safe_path(rel: str) -> tuple[Path | None, str | None]:
-    try:
-        resolved = (WORKDIR / rel).resolve()
-    except Exception as e:
-        return None, str(e)
-    if not resolved.is_relative_to(WORKDIR):
-        return None, f"Path traversal denied: {rel!r}"
-    return resolved, None
-
-
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ── Tools ────────────────────────────────────────────────────────────────────
 
 def tool_read_file(path: str) -> str:
-    p, err = safe_path(path)
-    if err:
-        return f"Error: {err}"
-    if not p.exists():
-        return f"Error: file not found: {path}"
+    p = safe_path(path)
     if not p.is_file():
-        return f"Error: not a file: {path}"
-    try:
-        text = p.read_text(errors="replace")
-        if len(text) > 50000:
-            text = text[:50000] + f"\n... [truncated — total {len(text)} chars]"
-        return text
-    except Exception as e:
-        return f"Error: {e}"
+        return f"ERROR: not a file: {path}"
+    content = p.read_text(errors="replace")
+    if len(content) > 50_000:
+        return content[:50_000] + f"\n... [truncated at 50k chars, total {len(content)}]"
+    return content
 
-
-_MAX_WRITE_CHARS = 2_000_000   # 2 MB safety limit
 
 def tool_write_file(path: str, content: str) -> str:
-    p, err = safe_path(path)
-    if err:
-        return f"Error: {err}"
-    if len(content) > _MAX_WRITE_CHARS:
-        return f"Error: content too large ({len(content):,} chars, limit {_MAX_WRITE_CHARS:,})"
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-        return f"OK: wrote {len(content)} chars to {path}"
-    except Exception as e:
-        return f"Error: {e}"
+    if len(content) > 2_000_000:
+        return "ERROR: content exceeds 2MB limit"
+    p = safe_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return f"OK: wrote {len(content)} chars to {path}"
 
 
 def tool_patch_file(path: str, old_str: str, new_str: str) -> str:
-    p, err = safe_path(path)
-    if err:
-        return f"Error: {err}"
-    if not p.exists():
-        return f"Error: file not found: {path}"
-    try:
-        text  = p.read_text(errors="replace")
-        count = text.count(old_str)
-        if count == 0:
-            return f"Error: old_str not found in {path}"
-        if count > 1:
-            return f"Error: old_str found {count} times — make it more specific"
-        p.write_text(text.replace(old_str, new_str, 1))
-        return f"OK: patched {path}"
-    except Exception as e:
-        return f"Error: {e}"
+    p = safe_path(path)
+    if not p.is_file():
+        return f"ERROR: not a file: {path}"
+    text = p.read_text(errors="replace")
+    count = text.count(old_str)
+    if count == 0:
+        return f"ERROR: old_str not found in {path}"
+    if count > 1:
+        return f"ERROR: old_str appears {count} times in {path} (must be exactly 1)"
+    text = text.replace(old_str, new_str, 1)
+    p.write_text(text)
+    return f"OK: patched {path}"
 
 
 def tool_ls(path: str = ".") -> str:
-    p, err = safe_path(path)
-    if err:
-        return f"Error: {err}"
-    if not p.exists():
-        return f"Error: path not found: {path}"
+    p = safe_path(path)
     if not p.is_dir():
-        return f"Error: not a directory: {path}"
-    try:
-        entries = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-        lines   = [e.name + ("/" if e.is_dir() else "") for e in entries]
-        return "\n".join(lines) if lines else "(empty)"
-    except Exception as e:
-        return f"Error: {e}"
+        return f"ERROR: not a directory: {path}"
+    entries = sorted(p.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+    lines = []
+    for e in entries:
+        if e.name in _SKIP_DIRS:
+            continue
+        lines.append(e.name + ("/" if e.is_dir() else ""))
+    return "\n".join(lines) if lines else "(empty directory)"
 
 
 def tool_grep(pattern: str, path: str = ".") -> str:
-    p, err = safe_path(path)
-    if err:
-        return f"Error: {err}"
+    p = safe_path(path)
+    exclude_args = []
+    for d in _SKIP_DIRS:
+        exclude_args.extend(["--exclude-dir", d])
+    cmd = ["grep", "-rn", "--color=never"] + exclude_args + ["--", pattern, str(p)]
     try:
-        exclude_args = [f"--exclude-dir={d}" for d in _SKIP_DIRS]
-        res = subprocess.run(
-            ["grep", "-rn", "--"] + exclude_args + [pattern, str(p)],
-            capture_output=True, text=True, timeout=15, cwd=str(WORKDIR),
-        )
-        out = res.stdout or res.stderr.strip() or "(no matches)"
-        # Strip absolute WORKDIR prefix so model gets relative paths
-        out = out.replace(str(WORKDIR) + "/", "")
-        if len(out) > 20000:
-            out = out[:20000] + "\n... [truncated]"
-        return out
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
-        return "Error: grep timed out"
-    except FileNotFoundError:
-        return "Error: grep not available"
-    except Exception as e:
-        return f"Error: {e}"
+        return "ERROR: grep timed out after 30s"
+    output = result.stdout
+    workdir_prefix = str(WORKDIR) + os.sep
+    output = output.replace(workdir_prefix, "")
+    lines = output.strip().split("\n")
+    if len(lines) > 200:
+        lines = lines[:200]
+        lines.append(f"... [truncated, {len(lines)} lines total]")
+    return "\n".join(lines) if lines[0] else "(no matches)"
 
-
-# Removed rm, cp, mv, mkdir, cat — destructive or filesystem-escaping.
-# shell=False (list form) prevents metacharacter injection ($(), &&, |, ;, etc.)
-SHELL_WHITELIST = {
-    "find", "wc", "head", "tail",
-    "sort", "uniq", "diff", "echo", "pwd", "date",
-}
 
 def tool_shell(command: str) -> str:
-    import shlex
+    if any(ch in command for ch in _SHELL_META):
+        return "ERROR: shell metacharacters are not allowed"
     try:
         parts = shlex.split(command)
     except ValueError as e:
-        return f"Error: cannot parse command: {e}"
-
+        return f"ERROR: failed to parse command: {e}"
     if not parts:
-        return "Error: empty command"
-
-    cmd = parts[0]
-    if cmd not in SHELL_WHITELIST:
-        allowed = ", ".join(sorted(SHELL_WHITELIST))
-        return f"Error: '{cmd}' not allowed. Allowed commands: {allowed}"
-
-    # Extra guard: reject shell metacharacters in raw command string
-    if any(c in command for c in '|&;$`><()!'):
-        return "Error: shell metacharacters not allowed"
-
-    # Ensure any absolute-path arguments stay within WORKDIR
+        return "ERROR: empty command"
+    if parts[0] not in _SHELL_WHITELIST:
+        return f"ERROR: command '{parts[0]}' is not in the whitelist: {', '.join(sorted(_SHELL_WHITELIST))}"
     for arg in parts[1:]:
-        if arg.startswith("/") or arg.startswith("~"):
-            try:
-                resolved = Path(arg).expanduser().resolve()
-            except Exception:
-                return f"Error: invalid path argument: {arg!r}"
-            if not resolved.is_relative_to(WORKDIR):
-                return f"Error: path argument outside WORKDIR: {arg!r}"
-
+        if arg.startswith("/"):
+            arg_path = Path(arg).resolve()
+            if not (str(arg_path) == str(WORKDIR) or str(arg_path).startswith(str(WORKDIR) + os.sep)):
+                return f"ERROR: absolute path outside WORKDIR: {arg}"
     try:
-        res = subprocess.run(
-            parts,                   # list — no shell interpretation
-            capture_output=True, text=True,
-            timeout=15, cwd=str(WORKDIR),
-        )
-        out = (res.stdout + res.stderr).strip() or "(no output)"
-        if len(out) > 20000:
-            out = out[:20000] + "\n... [truncated]"
-        return out
+        result = subprocess.run(parts, capture_output=True, text=True, timeout=30, cwd=str(WORKDIR))
     except subprocess.TimeoutExpired:
-        return "Error: command timed out (15s)"
-    except FileNotFoundError:
-        return f"Error: command not found: {cmd}"
-    except Exception as e:
-        return f"Error: {e}"
+        return "ERROR: command timed out after 30s"
+    output = (result.stdout + result.stderr).strip()
+    if len(output) > 50_000:
+        output = output[:50_000] + "\n... [truncated]"
+    return output if output else "(no output)"
 
 
 TOOL_HANDLERS = {
-    "read_file":  lambda a: tool_read_file(a["path"]),
-    "write_file": lambda a: tool_write_file(a["path"], a["content"]),
-    "patch_file": lambda a: tool_patch_file(a["path"], a["old_str"], a["new_str"]),
-    "ls":         lambda a: tool_ls(a.get("path", ".")),
-    "grep":       lambda a: tool_grep(a["pattern"], a.get("path", ".")),
-    "shell":      lambda a: tool_shell(a["command"]),
+    "read_file":  lambda args: tool_read_file(args["path"]),
+    "write_file": lambda args: tool_write_file(args["path"], args["content"]),
+    "patch_file": lambda args: tool_patch_file(args["path"], args["old_str"], args["new_str"]),
+    "ls":         lambda args: tool_ls(args.get("path", ".")),
+    "grep":       lambda args: tool_grep(args["pattern"], args.get("path", ".")),
+    "shell":      lambda args: tool_shell(args["command"]),
 }
 
-# Tools are described in the system prompt; the model outputs JSON to invoke them.
-TOOLS_PROMPT = f"""
-## Tools
 
-To call a tool, output ONLY a JSON object — no text before or after it:
-{{"tool": "TOOL_NAME", "args": {{"param": "value"}}}}
+def get_tools_prompt() -> str:
+    return """You have access to the following tools. To call a tool, respond with ONLY a JSON object (no other text):
 
-After receiving the result you may call another tool or give your final answer as plain text.
+{"tool": "read_file", "args": {"path": "<relative path>"}}
+  Read a file (max 50k chars).
 
-Available tools:
+{"tool": "write_file", "args": {"path": "<relative path>", "content": "<full content>"}}
+  Write a file (creates parent dirs). Max 2MB.
 
-read_file   — Read a file (max 50k chars)
-  args: path (string, required)
+{"tool": "patch_file", "args": {"path": "<relative path>", "old_str": "<exact text to find>", "new_str": "<replacement>"}}
+  Replace exactly 1 occurrence of old_str with new_str in a file.
 
-write_file  — Create or overwrite a file (max 2 MB)
-  args: path (string, required), content (string, required)
+{"tool": "ls", "args": {"path": "."}}
+  List directory. Dirs have trailing /.
 
-patch_file  — Replace exactly one occurrence of old_str with new_str; use new_str="" to delete
-  args: path (string, required), old_str (string, required), new_str (string, required)
+{"tool": "grep", "args": {"pattern": "<regex>", "path": "."}}
+  Recursive grep. Returns file:line:match.
 
-ls          — List directory contents (non-recursive)
-  args: path (string, optional, default ".")
+{"tool": "shell", "args": {"command": "<command>"}}
+  Run a whitelisted command (find, wc, head, tail, sort, uniq, diff, echo, pwd, date).
+  No shell metacharacters. No absolute paths outside workdir.
 
-grep        — Recursive text search; returns file:line:content matches
-  args: pattern (string, required), path (string, optional, default ".")
-
-shell       — Run a whitelisted command: {' '.join(sorted(SHELL_WHITELIST))}
-  args: command (string, required)
+IMPORTANT:
+- When calling a tool, output ONLY the JSON object. No explanations before or after.
+- After receiving tool output, you may call another tool or provide your final answer.
+- When you are done and want to reply to the user, just write your response normally (no JSON).
 """
 
 
-def _parse_tool_call(content: str) -> dict | None:
-    """
-    Try to extract a tool call from model output.
-    Accepts bare JSON or a ```json ... ``` fenced block.
-    Returns {{"tool": str, "args": dict}} or None.
-    """
-    candidates = [content.strip()]
-
-    # Also try to extract from a fenced code block
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if m:
-        candidates.append(m.group(1).strip())
-
-    for text in candidates:
+def _parse_tool_call(content: str):
+    """Extract {"tool":..., "args":...} from model output. Returns dict or None."""
+    content = content.strip()
+    # Try bare JSON first
+    if content.startswith("{"):
         try:
-            obj = json.loads(text)
-            if isinstance(obj, dict) and "tool" in obj:
-                return {"tool": obj["tool"], "args": obj.get("args", {})}
-        except (json.JSONDecodeError, ValueError):
+            obj = json.loads(content)
+            if "tool" in obj and "args" in obj:
+                return obj
+        except json.JSONDecodeError:
             pass
-
+    # Try ```json block
+    m = re.search(r"```(?:json)?\s*\n?(\{.*?\})\s*\n?```", content, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            if "tool" in obj and "args" in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
+    # Try to find JSON object anywhere in the text
+    m = re.search(r'(\{"tool"\s*:.*?\})\s*$', content, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            if "tool" in obj and "args" in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
     return None
 
 
-# ── Worklog ───────────────────────────────────────────────────────────────────
+# ── Repo context ─────────────────────────────────────────────────────────────
 
-WORKLOG = WORKDIR / ".worklog.md"
+def scan_repo() -> str:
+    """Walk WORKDIR, extract Python signatures/docstrings. List other files."""
+    lines = []
+    py_files = []
+    other_files = []
 
-def _wlog(text: str):
-    with open(WORKLOG, "a") as f:
-        f.write(text)
+    for root, dirs, files in os.walk(WORKDIR):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        rel_root = Path(root).relative_to(WORKDIR)
+        for fname in sorted(files):
+            fpath = Path(root) / fname
+            rel = str(rel_root / fname) if str(rel_root) != "." else fname
+            ext = fpath.suffix.lower()
+            if ext == ".py":
+                py_files.append((rel, fpath))
+            elif ext not in _BINARY_EXTS:
+                other_files.append(rel)
 
-def worklog_session_open(mode: str, resumed_from: "Path | None" = None):
-    """Write the opening header once per agent run."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"\n## Session {ts}  [{mode} | model: {MODEL}]\n"
-    if resumed_from:
-        header += f"_Resumed: {resumed_from.name}_\n"
-    header += "\n"
-    _wlog(header)
+    for rel, fpath in py_files:
+        lines.append(f"\n### {rel}")
+        try:
+            source = fpath.read_text(errors="replace")
+            tree = _ast.parse(source)
+        except SyntaxError:
+            lines.append("  (SyntaxError — could not parse)")
+            continue
+        except Exception:
+            lines.append("  (could not read)")
+            continue
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                args_list = []
+                for arg in node.args.args:
+                    ann = ""
+                    if arg.annotation:
+                        try:
+                            ann = ": " + _ast.unparse(arg.annotation)
+                        except Exception:
+                            pass
+                    args_list.append(arg.arg + ann)
+                ret = ""
+                if node.returns:
+                    try:
+                        ret = " -> " + _ast.unparse(node.returns)
+                    except Exception:
+                        pass
+                sig = f"def {node.name}({', '.join(args_list)}){ret}"
+                lines.append(f"  {sig}")
+                doc = _ast.get_docstring(node)
+                if doc:
+                    first_line = doc.strip().split("\n")[0]
+                    lines.append(f"    \"\"\"{first_line}\"\"\"")
+            elif isinstance(node, _ast.ClassDef):
+                lines.append(f"  class {node.name}")
+                doc = _ast.get_docstring(node)
+                if doc:
+                    first_line = doc.strip().split("\n")[0]
+                    lines.append(f"    \"\"\"{first_line}\"\"\"")
 
-def worklog_session_close():
-    _wlog("---\n")
+    if other_files:
+        lines.append("\n### Other files")
+        for f in other_files[:100]:
+            lines.append(f"  {f}")
+        if len(other_files) > 100:
+            lines.append(f"  ... and {len(other_files) - 100} more")
 
-def worklog_turn(task: str):
-    """Log one user turn inside an open session."""
-    _wlog(f"**Turn:** {task}\n\n")
-
-def worklog_tool(name: str, args: dict, result: str):
-    brief_args = ", ".join(
-        (f"{k}=<{len(v)} chars>" if k == "content" else f"{k}={repr(v)[:50]}")
-        for k, v in args.items()
-    )
-    summary = result.splitlines()[0][:100] if result else ""
-    _wlog(f"- `{name}({brief_args})` → {summary}\n")
-
-def worklog_result(summary: str):
-    _wlog(f"\n→ {summary[:300]}\n\n")
-
-# kept for one-shot compatibility
-def worklog_session_start(task: str):
-    worklog_session_open("one-shot")
-    worklog_turn(task)
-
-
-# ── Agent loop ────────────────────────────────────────────────────────────────
-
-CONTEXT_FILE = WORKDIR / ".agent_context.md"
+    return "\n".join(lines)
 
 
 def load_repo_context() -> str:
-    """Return injected context string if .agent_context.md exists, else ''."""
-    if CONTEXT_FILE.exists():
-        try:
-            content = CONTEXT_FILE.read_text().strip()
-            return f"\n\n---\n{content}\n---"
-        except Exception:
-            pass
+    ctx_file = WORKDIR / ".agent_context.md"
+    if ctx_file.is_file():
+        return ctx_file.read_text(errors="replace")[:20_000]
     return ""
 
 
-_SYSTEM_BASE = f"""You are a coding agent working in the directory: {WORKDIR}
-
-Always read a file before editing it.
-Use patch_file for targeted changes; use write_file only for new files or full rewrites.
-Be precise with patch_file — old_str must match the file exactly, including whitespace.
-
-Function signature rule: whenever you add, remove, or rename a parameter in a function
-definition, you MUST use grep to find every call site of that function across the entire
-codebase and update each one. Never leave callers out of sync with the new signature.
-
-When done, respond with plain text summarizing what you did.
-{TOOLS_PROMPT}"""
-
-
-def build_system_prompt() -> str:
-    """Base prompt + repo context if .agent_context.md exists."""
-    return _SYSTEM_BASE + load_repo_context()
+def build_agent_system_prompt(custom_system: str = "") -> str:
+    parts = []
+    parts.append("You are a coding agent. You help the user by reading, writing, and modifying files in their project.")
+    if custom_system:
+        parts.append(custom_system)
+    parts.append(get_tools_prompt())
+    ctx = load_repo_context()
+    if ctx:
+        parts.append(f"## Project context (.agent_context.md)\n{ctx}")
+    parts.append(f"Working directory: {WORKDIR}")
+    return "\n\n".join(parts)
 
 
-# Keep SYSTEM_PROMPT as an alias used by session-load (overwritten at session start)
-SYSTEM_PROMPT = build_system_prompt()
+# ── JSON storage ─────────────────────────────────────────────────────────────
 
+_data_lock = threading.Lock()
 
-def _run_task(messages: list) -> str | None:
-    """
-    Run the agentic loop for the current messages list.
-    The model signals tool calls by outputting a JSON object; we parse and execute it.
-    Returns the final assistant text, or None on cancellation/error.
-    """
-    tool_call_count = 0
-
-    while True:
-        data, err = api_call(messages)
-
-        if err == "cancelled":
-            return None
-
-        if err:
-            print(f"[API error] {err}", file=sys.stderr)
-            return None
-
-        choice  = data["choices"][0]
-        msg     = choice["message"]
-        content = msg.get("content") or ""
-        messages.append(msg)
-
-        tc = _parse_tool_call(content)
-
-        if tc and tool_call_count < MAX_TOOL_CALLS:
-            tool_call_count += 1
-            name = tc["tool"]
-            args = tc["args"]
-
-            label = args.get("path") or args.get("command") or args.get("pattern") or ""
-            print(f"⚡ {name} {label}", end="", flush=True)
-
-            handler = TOOL_HANDLERS.get(name)
-            try:
-                result = handler(args) if handler else f"Error: unknown tool {name!r}"
-            except KeyError as e:
-                result = f"Error: missing required argument {e}"
-            except Exception as e:
-                result = f"Error: {e}"
-
-            # Inline result summary
-            first_line = result.splitlines()[0] if result else ""
-            if result.startswith("Error") or result.startswith("OK"):
-                print(f"  → {first_line}", flush=True)
-            else:
-                print(f"  → {result.count(chr(10)) + 1} lines, {len(result)} chars", flush=True)
-
-            worklog_tool(name, args, result)
-
-            messages.append({
-                "role":    "user",
-                "content": f"[tool result: {name}]\n{result}",
-            })
-
-        elif tc and tool_call_count >= MAX_TOOL_CALLS:
-            print(f"[max tool calls ({MAX_TOOL_CALLS}) reached — stopping]", file=sys.stderr)
-            return content
-
-        else:
-            return content
-
-
-# ── Repo context (.agent_context.md) ─────────────────────────────────────────
-#
-# Inspired by aider's repo-map and Cline's Memory Bank:
-# - scan_repo()  builds a compact file map using Python ast (no deps)
-# - /init        scan + ask model to write purpose & architecture notes
-# - /update      ask model to revise context based on current session
-# - /reinit      rescan + ask model to reconcile map with existing notes
-# The resulting .agent_context.md is injected into the system prompt on start.
-
-_SKIP_DIRS  = {".git", "__pycache__", "venv", ".venv", ".sessions",
-               "node_modules", "dist", "build", ".tox", ".mypy_cache"}
-_SKIP_FILES = {".agent_context.md", ".worklog.md"}
-
-
-def _func_sig(node) -> str:
-    """Reconstruct function signature string from AST node (no body)."""
-    args   = node.args
-    parts  = []
-    n_args = len(args.args)
-    n_def  = len(args.defaults)
-
-    for i, arg in enumerate(args.args):
-        if arg.arg == "self":
-            continue
-        di = i - (n_args - n_def)
-        if di >= 0:
-            try:
-                default = _ast.unparse(args.defaults[di])
-                parts.append(f"{arg.arg}={default}")
-            except Exception:
-                parts.append(arg.arg)
-        else:
-            parts.append(arg.arg)
-
-    for arg in args.posonlyargs:
-        parts.insert(0, arg.arg)
-
-    if args.vararg:
-        parts.append(f"*{args.vararg.arg}")
-    for kwarg in args.kwonlyargs:
-        parts.append(kwarg.arg)
-    if args.kwarg:
-        parts.append(f"**{args.kwarg.arg}")
-
-    prefix = "async def" if isinstance(node, _ast.AsyncFunctionDef) else "def"
-    return f"{prefix} {node.name}({', '.join(parts)})"
-
-
-def _scan_py(path: Path) -> dict:
-    """Parse one .py file → {docstring, defs:[{kind,sig/name,doc,line,methods?}]}."""
-    try:
-        tree = _ast.parse(path.read_text(errors="replace"))
-    except SyntaxError:
-        return {"docstring": None, "defs": []}
-
-    docstring = _ast.get_docstring(tree)
-    defs      = []
-
-    for node in _ast.iter_child_nodes(tree):
-        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
-            defs.append({
-                "kind": "func",
-                "sig":  _func_sig(node),
-                "doc":  (_ast.get_docstring(node) or "").split("\n")[0][:80],
-                "line": node.lineno,
-            })
-        elif isinstance(node, _ast.ClassDef):
-            methods = []
-            for item in _ast.iter_child_nodes(node):
-                if isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
-                    methods.append({
-                        "sig":  _func_sig(item),
-                        "doc":  (_ast.get_docstring(item) or "").split("\n")[0][:80],
-                        "line": item.lineno,
-                    })
-            defs.append({
-                "kind":    "class",
-                "name":    node.name,
-                "doc":     (_ast.get_docstring(node) or "").split("\n")[0][:80],
-                "line":    node.lineno,
-                "methods": methods,
-            })
-
-    return {"docstring": docstring, "defs": defs}
-
-
-def scan_repo() -> str:
-    """
-    Walk WORKDIR, extract structure from .py files via ast,
-    list other notable files. Returns a compact markdown file-map string.
-    """
-    lines = []
-    other = []   # non-python notable files
-
-    for root, dirs, files in os.walk(WORKDIR):
-        root_path = Path(root)
-        # Prune ignored dirs in-place
-        dirs[:] = sorted(d for d in dirs if d not in _SKIP_DIRS and not d.startswith("."))
-
-        rel_root = root_path.relative_to(WORKDIR)
-
-        for fname in sorted(files):
-            fpath    = root_path / fname
-            rel_path = str(fpath.relative_to(WORKDIR))
-
-            if fname in _SKIP_FILES or fname.startswith("."):
-                continue
-
-            if fname.endswith(".py"):
-                info = _scan_py(fpath)
-                header = rel_path
-                if info["docstring"]:
-                    header += f" — {info['docstring'].split(chr(10))[0][:80]}"
-                lines.append(f"\n{header}")
-
-                for d in info["defs"]:
-                    if d["kind"] == "func":
-                        doc_hint = f"  # {d['doc']}" if d["doc"] else ""
-                        lines.append(f"  {d['sig']}{doc_hint}")
-                    elif d["kind"] == "class":
-                        doc_hint = f"  # {d['doc']}" if d["doc"] else ""
-                        lines.append(f"  class {d['name']}{doc_hint}")
-                        for m in d["methods"]:
-                            mdoc = f"  # {m['doc']}" if m["doc"] else ""
-                            lines.append(f"    {m['sig']}{mdoc}")
-            else:
-                # Include non-python files as a flat list (skip binaries by ext)
-                _skip_exts = {".pyc", ".pyo", ".jpg", ".jpeg", ".png", ".gif",
-                              ".ico", ".woff", ".woff2", ".ttf", ".eot",
-                              ".db", ".sqlite", ".sqlite3", ".lock"}
-                if fpath.suffix.lower() not in _skip_exts:
-                    other.append(rel_path)
-
-    result = "## File map\n" + "\n".join(lines)
-    if other:
-        result += "\n\n## Other files\n" + "\n".join(f"  {p}" for p in other)
-    return result
-
-
-def _ask_for_context(file_map: str, existing: str | None = None) -> str | None:
-    """Ask the model to produce a .agent_context.md given the file map."""
-    if existing:
-        prompt = (
-            "Below is an updated file map of the repository, followed by the "
-            "existing .agent_context.md.\n\n"
-            "Produce a revised .agent_context.md that:\n"
-            "1. Updates the File Map section verbatim from the new scan below.\n"
-            "2. Preserves and lightly updates the Purpose and Architecture Notes "
-            "sections based on any new/changed/removed files.\n"
-            "Output ONLY the markdown content, starting with '# Repo Context'.\n\n"
-            f"=== NEW FILE MAP ===\n{file_map}\n\n"
-            f"=== EXISTING CONTEXT ===\n{existing}"
-        )
-    else:
-        prompt = (
-            "Below is a file map of a software repository extracted with Python ast.\n"
-            "Write a .agent_context.md with exactly these three sections:\n\n"
-            "# Repo Context\n\n"
-            "## Purpose\n"
-            "<2-4 sentences: what this repo does, its main goal>\n\n"
-            "## Architecture Notes\n"
-            "<bullet points: key modules, how they fit together, important patterns>\n\n"
-            "## File Map\n"
-            "<paste the file map below verbatim>\n\n"
-            "Output ONLY the markdown, no commentary.\n\n"
-            f"{file_map}"
-        )
-
-    msgs = [
-        {"role": "system",  "content": "You are a technical documentation writer."},
-        {"role": "user",    "content": prompt},
-    ]
-    data, err = api_call(msgs)
-    if err or not data:
-        return None
-    return data["choices"][0]["message"].get("content", "").strip()
-
-
-def _update_context_from_session(messages: list) -> str | None:
-    """Ask model to revise .agent_context.md based on what happened in this session."""
-    existing = CONTEXT_FILE.read_text() if CONTEXT_FILE.exists() else "(none)"
-    prompt = (
-        "Based on the conversation above, update the .agent_context.md below.\n"
-        "Revise the Purpose and Architecture Notes if anything changed.\n"
-        "Update the File Map only for files that were created or modified.\n"
-        "Output ONLY the full revised markdown, starting with '# Repo Context'.\n\n"
-        f"=== CURRENT .agent_context.md ===\n{existing}"
-    )
-    msgs = list(messages) + [{"role": "user", "content": prompt}]
-    data, err = api_call(msgs)
-    if err or not data:
-        return None
-    return data["choices"][0]["message"].get("content", "").strip()
-
-
-# ── Session persistence ───────────────────────────────────────────────────────
-
-SESSIONS_DIR       = WORKDIR / ".sessions"
-MAX_CONTEXT_CHARS  = int(os.environ.get("MAX_CONTEXT_CHARS", 1_000_000))  # ~256k tokens
-MAX_SESSIONS_KEEP  = int(os.environ.get("MAX_SESSIONS_KEEP", 50))
-
-
-def _sessions_dir() -> Path:
-    SESSIONS_DIR.mkdir(exist_ok=True)
-    return SESSIONS_DIR
-
-
-def _first_user_msg(messages: list) -> str:
-    """Return the first user message content (truncated), for session previews."""
-    for m in messages:
-        if m.get("role") == "user":
-            text = (m.get("content") or "").replace("\n", " ").strip()
-            return text[:80] + ("…" if len(text) > 80 else "")
-    return ""
-
-
-def _rotate_sessions(d: Path):
-    """Delete oldest session files beyond MAX_SESSIONS_KEEP."""
-    files = sorted(d.glob("session_*.json"), reverse=True)
-    for old in files[MAX_SESSIONS_KEEP:]:
-        try:
-            old.unlink()
-        except Exception:
-            pass
-
-
-def session_save(messages: list) -> Path:
-    """Write current messages to a timestamped JSON file. Returns path."""
-    d   = _sessions_dir()
-    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = d / f"session_{ts}.json"
-    payload = {
-        "started":      ts,
-        "last_updated": datetime.now().isoformat(timespec="seconds"),
-        "model":        MODEL,
-        "workdir":      str(WORKDIR),
-        "preview":      _first_user_msg(messages),
-        "messages":     messages,
+def _empty_data():
+    return {
+        "settings": {
+            "base_url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+            "model": os.environ.get("OPENAI_MODEL", "gpt-4o"),
+            "system_prompt": "",
+            "temperature": 0.7,
+            "max_tokens": 4096,
+            "mode": "chat",
+            "workdir": str(WORKDIR),
+        },
+        "chats": {},
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-    _rotate_sessions(d)
-    return path
 
 
-def session_autosave(messages: list, current_path: list):
-    """Overwrite current session file (or create one). current_path is a 1-elem list."""
-    if not current_path[0]:
-        current_path[0] = session_save(messages)
-    else:
-        payload = {
-            "last_updated": datetime.now().isoformat(timespec="seconds"),
-            "model":        MODEL,
-            "workdir":      str(WORKDIR),
-            "preview":      _first_user_msg(messages),
-            "messages":     messages,
-        }
-        current_path[0].write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+def load_data() -> dict:
+    with _data_lock:
+        if AGENT_DATA_PATH.is_file():
+            try:
+                return json.loads(AGENT_DATA_PATH.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        return _empty_data()
 
 
-def session_list() -> list[Path]:
-    """Return session files sorted newest-first."""
-    d = _sessions_dir()
-    return sorted(d.glob("session_*.json"), reverse=True)
+def save_data(data: dict):
+    with _data_lock:
+        AGENT_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AGENT_DATA_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def session_load(path: Path) -> list:
-    """Load messages from a session file."""
-    data = json.loads(path.read_text())
-    msgs = data.get("messages", [])
-    # Replace system prompt with current one (workdir may have changed)
-    if msgs and msgs[0]["role"] == "system":
-        msgs[0]["content"] = build_system_prompt()
-    return msgs
+# ── FastAPI app ──────────────────────────────────────────────────────────────
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+app = FastAPI()
 
 
-def _context_chars(messages: list) -> int:
-    """Rough character count of all message content."""
-    return sum(len(m.get("content") or "") for m in messages)
+# ── Routes: HTML ─────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML_PAGE
 
 
-def summarize_session(messages: list) -> str | None:
-    """
-    Ask the model for a compact summary of the conversation so far.
-    Returns the summary string, or None on error.
-    """
-    summary_request = (
-        "Summarize this conversation as concisely as possible. "
-        "Include: files touched, changes made, key decisions, and any open issues. "
-        "This summary will replace the full history in the next session."
-    )
-    slim = [m for m in messages if m["role"] in ("system", "user", "assistant")]
-    slim.append({"role": "user", "content": summary_request})
+# ── Routes: Settings ─────────────────────────────────────────────────────────
 
-    data, err = api_call(slim)
-    if err or not data:
-        return None
-    return data["choices"][0]["message"].get("content", "").strip()
+@app.get("/api/settings")
+async def get_settings():
+    data = load_data()
+    return JSONResponse(data["settings"])
 
 
-def offer_summarization(messages: list, current_session: list, force: bool = False) -> list:
-    """
-    Called when context is large. Asks user whether to summarize and restart.
-    Returns (possibly new) messages list.
-    """
-    chars = _context_chars(messages)
-    if force:
-        print("[summarizing current session…]", flush=True)
-    else:
-        print(
-            f"\n[context is {chars:,} chars (~{chars//4:,} tokens). "
-            f"Summarize and start a fresh session? (y/N)] ",
-            end="", flush=True,
-        )
+@app.post("/api/settings")
+async def post_settings(req: Request):
+    global WORKDIR
+    body = await req.json()
+    data = load_data()
+    for key in ("base_url", "api_key", "model", "system_prompt", "temperature", "max_tokens", "mode", "workdir"):
+        if key in body:
+            data["settings"][key] = body[key]
+    # Validate and update WORKDIR
+    if "workdir" in body:
+        new_wd = Path(body["workdir"]).resolve()
+        if new_wd.is_dir():
+            WORKDIR = new_wd
+            data["settings"]["workdir"] = str(WORKDIR)
+        else:
+            return JSONResponse({"error": f"Directory does not exist: {body['workdir']}"}, status_code=400)
+    save_data(data)
+    return JSONResponse(data["settings"])
+
+
+# ── Routes: Chats ────────────────────────────────────────────────────────────
+
+@app.get("/api/chats")
+async def list_chats():
+    data = load_data()
+    chats = []
+    for cid, chat in data["chats"].items():
+        chats.append({"id": cid, "title": chat["title"], "created_at": chat["created_at"], "updated_at": chat["updated_at"]})
+    chats.sort(key=lambda c: c["updated_at"], reverse=True)
+    return JSONResponse(chats)
+
+
+@app.post("/api/chats")
+async def create_chat(req: Request):
+    body = await req.json() if (await req.body()) else {}
+    data = load_data()
+    cid = str(uuid.uuid4())[:8]
+    now = datetime.now(timezone.utc).isoformat()
+    data["chats"][cid] = {
+        "title": body.get("title", "Новый чат"),
+        "created_at": now,
+        "updated_at": now,
+        "messages": [],
+    }
+    save_data(data)
+    return JSONResponse({"id": cid, "title": data["chats"][cid]["title"]})
+
+
+@app.put("/api/chats/{chat_id}")
+async def update_chat(chat_id: str, req: Request):
+    body = await req.json()
+    data = load_data()
+    if chat_id not in data["chats"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if "title" in body:
+        data["chats"][chat_id]["title"] = body["title"]
+    data["chats"][chat_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_data(data)
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(chat_id: str):
+    data = load_data()
+    if chat_id in data["chats"]:
+        del data["chats"][chat_id]
+        save_data(data)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/chats/{chat_id}/messages")
+async def get_messages(chat_id: str):
+    data = load_data()
+    if chat_id not in data["chats"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(data["chats"][chat_id]["messages"])
+
+
+@app.post("/api/chats/{chat_id}/messages")
+async def post_message(chat_id: str, req: Request):
+    body = await req.json()
+    data = load_data()
+    if chat_id not in data["chats"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    msg = {
+        "role": body["role"],
+        "content": body["content"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if "tool_calls" in body:
+        msg["tool_calls"] = body["tool_calls"]
+    data["chats"][chat_id]["messages"].append(msg)
+    data["chats"][chat_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # Auto-title
+    if data["chats"][chat_id]["title"] == "Новый чат" and body["role"] == "user":
+        data["chats"][chat_id]["title"] = body["content"][:40].strip()
+    save_data(data)
+    return JSONResponse({"ok": True})
+
+
+# ── Routes: Chat completions (streaming) ─────────────────────────────────────
+
+@app.post("/api/chat/completions")
+async def chat_completions(req: Request):
+    body = await req.json()
+    messages = body.get("messages", [])
+    settings = body.get("settings", {})
+
+    base_url = settings.get("base_url", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    api_key = settings.get("api_key", os.environ.get("OPENAI_API_KEY", ""))
+    model = settings.get("model", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    temperature = float(settings.get("temperature", 0.7))
+    max_tokens = int(settings.get("max_tokens", 4096))
+
+    def generate():
         try:
-            answer = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return messages
-        if answer != "y":
-            return messages
-        print("[summarizing…]", flush=True)
+            from openai import OpenAI
+            client = OpenAI(base_url=base_url, api_key=api_key)
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    text = chunk.choices[0].delta.content
+                    yield f"data: {json.dumps({'content': text})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    print("[summarizing…]", flush=True)
-    summary = summarize_session(messages)
-    if not summary:
-        print("[summarization failed — continuing with full context]\n")
-        return messages
-
-    # Archive old session before starting fresh
-    session_autosave(messages, current_session)
-    old_name = current_session[0].name if current_session[0] else "previous"
-    print(f"[archived as {old_name}]\n")
-    print("── Summary ─────────────────────────────────────")
-    print(summary)
-    print("─────────────────────────────────────────────────\n")
-
-    # New session: system prompt + summary as first assistant message
-    new_messages = [
-        {"role": "system",    "content": build_system_prompt()},
-        {"role": "assistant", "content": f"[Session summary]\n{summary}"},
-    ]
-    current_session[0] = None   # will get a new file on next autosave
-    return new_messages
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-# ── Interactive mode ──────────────────────────────────────────────────────────
+# ── Routes: Agent run (SSE) ──────────────────────────────────────────────────
 
-_HELP = """\
-Commands:
-  /init           — scan repo, generate .agent_context.md (injected every session)
-  /reinit         — rescan repo + reconcile with existing .agent_context.md
-  /update         — revise .agent_context.md based on this session's changes
-  /sessions       — list saved sessions with preview
-  /resume [N]     — resume session N from the list (default: last)
-  /save           — force-save current session now
-  /summarize      — summarize and compress context right now
-  /clear          — wipe conversation context (start fresh)
-  exit / quit     — save and exit
+@app.post("/api/agent/run")
+async def agent_run(req: Request):
+    body = await req.json()
+    chat_id = body.get("chat_id", "")
+    user_message = body.get("message", "")
+    settings = body.get("settings", {})
 
-CLI flags (one-shot or interactive):
-  --model MODEL   — override OPENAI_MODEL
-  --url URL       — override OPENAI_BASE_URL
-  --resume [N]    — resume last (or Nth) session at startup
-  --init          — generate .agent_context.md and exit
+    base_url = settings.get("base_url", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    api_key = settings.get("api_key", os.environ.get("OPENAI_API_KEY", ""))
+    model = settings.get("model", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+    temperature = float(settings.get("temperature", 0))
+    max_tokens = int(settings.get("max_tokens", 4096))
 
-.agent_context.md is injected into the system prompt on every session start.
-Context auto-saves after every turn. When it exceeds MAX_CONTEXT_CHARS
-you will be asked whether to summarize and start a fresh session.
+    queue: Queue = Queue()
+
+    def agent_thread():
+        try:
+            from openai import OpenAI
+            client = OpenAI(base_url=base_url, api_key=api_key)
+
+            system_prompt = build_agent_system_prompt(settings.get("system_prompt", ""))
+
+            # Load conversation history
+            data = load_data()
+            history_msgs = []
+            if chat_id and chat_id in data["chats"]:
+                for m in data["chats"][chat_id]["messages"]:
+                    history_msgs.append({"role": m["role"], "content": m["content"]})
+
+            api_messages = [{"role": "system", "content": system_prompt}]
+            api_messages.extend(history_msgs)
+            api_messages.append({"role": "user", "content": user_message})
+
+            tool_calls_log = []
+
+            for iteration in range(MAX_TOOL_CALLS):
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=api_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = response.choices[0].message.content or ""
+                tc = _parse_tool_call(content)
+
+                if tc is None:
+                    # Final text response
+                    queue.put({"type": "text", "content": content})
+                    # Save assistant message with tool_calls metadata
+                    if chat_id:
+                        data2 = load_data()
+                        if chat_id in data2["chats"]:
+                            msg = {
+                                "role": "assistant",
+                                "content": content,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            }
+                            if tool_calls_log:
+                                msg["tool_calls"] = tool_calls_log
+                            data2["chats"][chat_id]["messages"].append(msg)
+                            data2["chats"][chat_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+                            save_data(data2)
+                    break
+
+                tool_name = tc["tool"]
+                tool_args = tc["args"]
+
+                handler = TOOL_HANDLERS.get(tool_name)
+                if handler is None:
+                    result = f"ERROR: unknown tool '{tool_name}'"
+                else:
+                    try:
+                        result = handler(tool_args)
+                    except Exception as e:
+                        result = f"ERROR: {e}"
+
+                # Summarize for display
+                summary = _tool_summary(tool_name, tool_args, result)
+                tool_calls_log.append({"tool": tool_name, "args": tool_args, "summary": summary})
+                queue.put({"type": "tool", "tool": tool_name, "summary": summary})
+
+                # Feed result back to the model
+                api_messages.append({"role": "assistant", "content": content})
+                api_messages.append({"role": "user", "content": f"[Tool result for {tool_name}]\n{result}"})
+            else:
+                queue.put({"type": "text", "content": f"(Reached maximum of {MAX_TOOL_CALLS} tool calls. Stopping.)"})
+
+        except Exception as e:
+            queue.put({"type": "error", "content": str(e)})
+        finally:
+            queue.put(None)  # sentinel
+
+    threading.Thread(target=agent_thread, daemon=True).start()
+
+    def generate():
+        while True:
+            event = queue.get()
+            if event is None:
+                yield "data: [DONE]\n\n"
+                break
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+def _tool_summary(tool_name: str, args: dict, result: str) -> str:
+    if tool_name == "read_file":
+        lines = result.count("\n") + 1 if result and not result.startswith("ERROR") else 0
+        chars = len(result)
+        return f"read_file {args.get('path', '?')} → {lines} lines, {chars} chars"
+    elif tool_name == "write_file":
+        if result.startswith("OK"):
+            return f"write_file {args.get('path', '?')} → {result}"
+        return f"write_file {args.get('path', '?')} → {result[:80]}"
+    elif tool_name == "patch_file":
+        return f"patch_file {args.get('path', '?')} → {result[:80]}"
+    elif tool_name == "ls":
+        count = len(result.split("\n")) if result and not result.startswith("ERROR") else 0
+        return f"ls {args.get('path', '.')} → {count} entries"
+    elif tool_name == "grep":
+        count = len(result.split("\n")) if result and not result.startswith("ERROR") and result != "(no matches)" else 0
+        return f"grep '{args.get('pattern', '?')}' → {count} matches"
+    elif tool_name == "shell":
+        return f"shell: {args.get('command', '?')} → {len(result)} chars"
+    return f"{tool_name} → {result[:60]}"
+
+
+# ── Routes: Agent commands (/init, /reinit) ──────────────────────────────────
+
+@app.post("/api/agent/cmd")
+async def agent_cmd(req: Request):
+    body = await req.json()
+    command = body.get("command", "")
+    settings = body.get("settings", {})
+
+    if command not in ("init", "reinit"):
+        return JSONResponse({"error": f"Unknown command: {command}"}, status_code=400)
+
+    base_url = settings.get("base_url", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    api_key = settings.get("api_key", os.environ.get("OPENAI_API_KEY", ""))
+    model = settings.get("model", os.environ.get("OPENAI_MODEL", "gpt-4o"))
+
+    # Scan repo
+    repo_scan = scan_repo()
+    if not repo_scan.strip():
+        return JSONResponse({"result": "No files found in workdir.", "scan": ""})
+
+    # Ask LLM to generate .agent_context.md
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a senior developer. Given a repository scan (file list + Python signatures), write a concise .agent_context.md that helps a coding agent understand the project. Include: purpose, architecture, key files, how to run/test. Be brief and practical. Output ONLY the markdown content."},
+                {"role": "user", "content": f"Repository scan:\n{repo_scan}"},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        ctx_content = resp.choices[0].message.content or ""
+        ctx_file = WORKDIR / ".agent_context.md"
+        ctx_file.write_text(ctx_content)
+        return JSONResponse({"result": f"Generated .agent_context.md ({len(ctx_content)} chars)", "scan": repo_scan[:5000]})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ── HTML ─────────────────────────────────────────────────────────────────────
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent</title>
+<style>
+:root{
+  --bg:#0c0c0e;--surface:#151518;--surface2:#1e1e23;--surface3:#26262d;
+  --border:#2a2a32;--border2:#35353f;
+  --text:#e4e4e7;--text2:#8b8b96;--text3:#5a5a65;
+  --accent:#6d9fff;--accent2:#5580d4;--accent-dim:rgba(109,159,255,.08);
+  --user-bg:#171d2a;--user-border:rgba(109,159,255,.12);
+  --danger:#ef4444;--green:#34d399;
+  --radius:10px;
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  --mono:'SF Mono','Cascadia Code','JetBrains Mono','Fira Code',monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex}
+
+/* Sidebar */
+.sidebar{width:260px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;transition:margin-left .2s}
+.sidebar.hidden{margin-left:-260px}
+.sidebar-header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+.sidebar-header h2{font-size:14px;font-weight:600;color:var(--text2)}
+.btn-new-chat{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;font-weight:500}
+.btn-new-chat:hover{background:var(--accent2)}
+.chat-list{flex:1;overflow-y:auto;padding:8px}
+.chat-item{padding:10px 12px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px;display:flex;align-items:center;justify-content:space-between}
+.chat-item:hover{background:var(--surface2)}
+.chat-item.active{background:var(--surface3);color:var(--text)}
+.chat-item .chat-title{flex:1;overflow:hidden;text-overflow:ellipsis}
+.chat-item .chat-delete{display:none;background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:0 4px;flex-shrink:0}
+.chat-item:hover .chat-delete{display:block}
+.chat-item .chat-delete:hover{color:var(--danger)}
+
+/* Main */
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+
+/* Topbar */
+.topbar{height:48px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0}
+.btn-hamburger{background:none;border:none;color:var(--text2);font-size:18px;cursor:pointer;padding:4px}
+.model-badge{background:var(--surface3);color:var(--text2);font-size:11px;padding:3px 8px;border-radius:5px;font-family:var(--mono)}
+.mode-toggle{display:flex;background:var(--surface2);border-radius:6px;overflow:hidden;margin-left:auto}
+.mode-btn{background:none;border:none;color:var(--text3);font-size:12px;padding:6px 14px;cursor:pointer;transition:all .15s}
+.mode-btn.active{background:var(--accent);color:#fff}
+.btn-settings{background:none;border:none;color:var(--text2);font-size:16px;cursor:pointer;padding:4px 6px}
+
+/* Settings panel */
+.settings-panel{width:340px;background:var(--surface);border-left:1px solid var(--border);flex-shrink:0;overflow-y:auto;padding:20px;display:none;flex-direction:column;gap:14px}
+.settings-panel.open{display:flex}
+.settings-panel h3{font-size:13px;font-weight:600;color:var(--text2);margin-bottom:4px}
+.settings-panel label{font-size:12px;color:var(--text3);display:block;margin-bottom:4px}
+.settings-panel input,.settings-panel textarea,.settings-panel select{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;font-family:var(--font);outline:none}
+.settings-panel input:focus,.settings-panel textarea:focus{border-color:var(--accent)}
+.settings-panel textarea{resize:vertical;min-height:60px;font-family:var(--mono);font-size:12px}
+.agent-section{border-top:1px solid var(--border);padding-top:14px;margin-top:6px}
+.btn-cmd{background:var(--surface3);color:var(--text2);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:var(--mono)}
+.btn-cmd:hover{background:var(--surface2);border-color:var(--border2)}
+.cmd-status{font-size:11px;color:var(--text3);margin-top:4px;font-family:var(--mono)}
+
+/* Messages */
+.messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:16px}
+.msg{max-width:800px;width:100%;margin:0 auto;padding:12px 16px;border-radius:var(--radius);font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+.msg.user{background:var(--user-bg);border:1px solid var(--user-border)}
+.msg.assistant{background:transparent}
+.msg .tool-calls{margin-bottom:8px}
+.tool-call-line{font-family:var(--mono);font-size:11px;color:var(--text3);padding:2px 0;line-height:1.5}
+.msg .msg-content p{margin:0 0 8px 0}
+.msg .msg-content p:last-child{margin-bottom:0}
+.msg .msg-content pre{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;overflow-x:auto;margin:8px 0;font-family:var(--mono);font-size:12px;line-height:1.5}
+.msg .msg-content code{font-family:var(--mono);font-size:12px;background:var(--surface2);padding:1px 5px;border-radius:3px}
+.msg .msg-content pre code{background:none;padding:0}
+
+/* Input */
+.input-area{background:var(--surface);border-top:1px solid var(--border);padding:14px 20px;flex-shrink:0}
+.input-wrap{max-width:800px;margin:0 auto;display:flex;gap:10px;align-items:flex-end}
+.input-wrap textarea{flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:var(--radius);padding:10px 14px;font-size:14px;font-family:var(--font);line-height:1.5;resize:none;outline:none;max-height:200px;min-height:42px}
+.input-wrap textarea:focus{border-color:var(--accent)}
+.btn-send{background:var(--accent);color:#fff;border:none;border-radius:8px;width:40px;height:40px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.btn-send:hover{background:var(--accent2)}
+.btn-send:disabled{opacity:.4;cursor:not-allowed}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--border2)}
+
+/* Empty state */
+.empty-state{flex:1;display:flex;align-items:center;justify-content:center;color:var(--text3);font-size:14px}
+</style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <h2>Chats</h2>
+    <button class="btn-new-chat" onclick="newChat()">+ New</button>
+  </div>
+  <div class="chat-list" id="chatList"></div>
+</div>
+
+<!-- Main -->
+<div class="main">
+  <!-- Topbar -->
+  <div class="topbar">
+    <button class="btn-hamburger" onclick="toggleSidebar()">&#9776;</button>
+    <span class="model-badge" id="modelBadge">gpt-4o</span>
+    <div class="mode-toggle">
+      <button class="mode-btn active" id="btnChat" onclick="setMode('chat')">&#128172; Chat</button>
+      <button class="mode-btn" id="btnCode" onclick="setMode('code')">&#9889; Code</button>
+    </div>
+    <button class="btn-settings" onclick="toggleSettings()">&#9881;</button>
+  </div>
+
+  <!-- Content area -->
+  <div style="flex:1;display:flex;overflow:hidden">
+    <!-- Messages -->
+    <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+      <div class="messages" id="messages">
+        <div class="empty-state" id="emptyState">Start a new conversation</div>
+      </div>
+      <div class="input-area">
+        <div class="input-wrap">
+          <textarea id="input" rows="1" placeholder="Type a message..." onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <button class="btn-send" id="btnSend" onclick="sendMessage()">&#9654;</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings panel -->
+    <div class="settings-panel" id="settingsPanel">
+      <h3>Settings</h3>
+      <div>
+        <label>Base URL</label>
+        <input id="sBaseUrl" placeholder="https://api.openai.com/v1">
+      </div>
+      <div>
+        <label>API Key</label>
+        <input id="sApiKey" type="password" placeholder="sk-...">
+      </div>
+      <div>
+        <label>Model</label>
+        <input id="sModel" placeholder="gpt-4o">
+      </div>
+      <div>
+        <label>System Prompt</label>
+        <textarea id="sSystemPrompt" rows="3" placeholder="You are a helpful assistant."></textarea>
+      </div>
+      <div>
+        <label>Temperature</label>
+        <input id="sTemperature" type="number" step="0.1" min="0" max="2" value="0.7">
+      </div>
+      <div>
+        <label>Max Tokens</label>
+        <input id="sMaxTokens" type="number" step="256" min="256" max="128000" value="4096">
+      </div>
+      <div class="agent-section" id="agentSection" style="display:none">
+        <h3>Agent (Code mode)</h3>
+        <div>
+          <label>Working Directory</label>
+          <input id="sWorkdir" placeholder="/path/to/project">
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn-cmd" onclick="agentCmd('init')">/init</button>
+          <button class="btn-cmd" onclick="agentCmd('reinit')">/reinit</button>
+        </div>
+        <div class="cmd-status" id="cmdStatus"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──
+let S = {
+  chats: [],
+  currentChat: null,
+  settings: {},
+  mode: 'chat',
+  streaming: false,
+};
+
+// ── Init ──
+(async function init() {
+  await loadSettings();
+  await loadChats();
+})();
+
+// ── Settings ──
+async function loadSettings() {
+  const r = await fetch('/api/settings');
+  S.settings = await r.json();
+  applySettings();
+}
+
+function applySettings() {
+  document.getElementById('sBaseUrl').value = S.settings.base_url || '';
+  document.getElementById('sApiKey').value = S.settings.api_key || '';
+  document.getElementById('sModel').value = S.settings.model || 'gpt-4o';
+  document.getElementById('sSystemPrompt').value = S.settings.system_prompt || '';
+  document.getElementById('sTemperature').value = S.settings.temperature ?? 0.7;
+  document.getElementById('sMaxTokens').value = S.settings.max_tokens ?? 4096;
+  document.getElementById('sWorkdir').value = S.settings.workdir || '';
+  document.getElementById('modelBadge').textContent = S.settings.model || 'gpt-4o';
+  setMode(S.settings.mode || 'chat');
+}
+
+function getSettings() {
+  return {
+    base_url: document.getElementById('sBaseUrl').value,
+    api_key: document.getElementById('sApiKey').value,
+    model: document.getElementById('sModel').value,
+    system_prompt: document.getElementById('sSystemPrompt').value,
+    temperature: parseFloat(document.getElementById('sTemperature').value) || 0.7,
+    max_tokens: parseInt(document.getElementById('sMaxTokens').value) || 4096,
+    mode: S.mode,
+    workdir: document.getElementById('sWorkdir').value,
+  };
+}
+
+async function saveSettings() {
+  const s = getSettings();
+  const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(s)});
+  const data = await r.json();
+  if (data.error) { alert(data.error); return; }
+  S.settings = data;
+  document.getElementById('modelBadge').textContent = data.model || 'gpt-4o';
+}
+
+// Debounced auto-save settings
+let _saveTimer = null;
+function debounceSave() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(saveSettings, 800);
+}
+document.querySelectorAll('.settings-panel input, .settings-panel textarea').forEach(el => {
+  el.addEventListener('input', debounceSave);
+});
+
+// ── Mode toggle ──
+function setMode(mode) {
+  S.mode = mode;
+  document.getElementById('btnChat').classList.toggle('active', mode === 'chat');
+  document.getElementById('btnCode').classList.toggle('active', mode === 'code');
+  document.getElementById('agentSection').style.display = mode === 'code' ? 'block' : 'none';
+}
+
+// ── Sidebar ──
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('hidden');
+}
+
+function toggleSettings() {
+  document.getElementById('settingsPanel').classList.toggle('open');
+}
+
+// ── Chats ──
+async function loadChats() {
+  const r = await fetch('/api/chats');
+  S.chats = await r.json();
+  renderChatList();
+}
+
+function renderChatList() {
+  const el = document.getElementById('chatList');
+  el.innerHTML = '';
+  for (const c of S.chats) {
+    const d = document.createElement('div');
+    d.className = 'chat-item' + (S.currentChat === c.id ? ' active' : '');
+    d.innerHTML = `<span class="chat-title">${esc(c.title)}</span><button class="chat-delete" onclick="event.stopPropagation();deleteChat('${c.id}')">&times;</button>`;
+    d.onclick = () => openChat(c.id);
+    d.ondblclick = () => renameChat(c.id, c.title);
+    el.appendChild(d);
+  }
+}
+
+async function newChat() {
+  const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+  const c = await r.json();
+  await loadChats();
+  openChat(c.id);
+}
+
+async function openChat(id) {
+  S.currentChat = id;
+  renderChatList();
+  const r = await fetch(`/api/chats/${id}/messages`);
+  const msgs = await r.json();
+  renderMessages(msgs);
+}
+
+async function deleteChat(id) {
+  await fetch(`/api/chats/${id}`, {method:'DELETE'});
+  if (S.currentChat === id) {
+    S.currentChat = null;
+    document.getElementById('messages').innerHTML = '<div class="empty-state">Start a new conversation</div>';
+  }
+  await loadChats();
+}
+
+async function renameChat(id, oldTitle) {
+  const title = prompt('Rename chat:', oldTitle);
+  if (title && title !== oldTitle) {
+    await fetch(`/api/chats/${id}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title})});
+    await loadChats();
+  }
+}
+
+// ── Messages ──
+function renderMessages(msgs) {
+  const el = document.getElementById('messages');
+  el.innerHTML = '';
+  if (!msgs.length) {
+    el.innerHTML = '<div class="empty-state">Start a new conversation</div>';
+    return;
+  }
+  for (const m of msgs) {
+    appendMessage(m.role, m.content, m.tool_calls || []);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+function appendMessage(role, content, toolCalls) {
+  const el = document.getElementById('messages');
+  const empty = document.getElementById('emptyState');
+  if (empty) empty.remove();
+  const d = document.createElement('div');
+  d.className = `msg ${role}`;
+  let html = '';
+  if (toolCalls && toolCalls.length) {
+    html += '<div class="tool-calls">';
+    for (const tc of toolCalls) {
+      html += `<div class="tool-call-line">&#9889; ${esc(tc.summary || tc.tool)}</div>`;
+    }
+    html += '</div>';
+  }
+  html += `<div class="msg-content">${renderMarkdown(content)}</div>`;
+  d.innerHTML = html;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+  return d;
+}
+
+function renderMarkdown(text) {
+  if (!text) return '';
+  // Code blocks
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${esc(code.trim())}</code></pre>`);
+  // Inline code
+  text = text.replace(/`([^`]+)`/g, (_, c) => `<code>${esc(c)}</code>`);
+  // Bold
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Paragraphs (split by double newlines)
+  const parts = text.split(/\n\n+/);
+  return parts.map(p => {
+    if (p.startsWith('<pre>') || p.startsWith('<h')) return p;
+    return `<p>${p.replace(/\n/g, '<br>')}</p>`;
+  }).join('');
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Input ──
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+}
+
+// ── Send ──
+async function sendMessage() {
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text || S.streaming) return;
+
+  // Ensure we have a chat
+  if (!S.currentChat) {
+    const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({})});
+    const c = await r.json();
+    S.currentChat = c.id;
+    await loadChats();
+  }
+
+  // Save user message
+  await fetch(`/api/chats/${S.currentChat}/messages`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({role:'user', content:text})
+  });
+
+  appendMessage('user', text, []);
+  input.value = '';
+  input.style.height = 'auto';
+
+  S.streaming = true;
+  document.getElementById('btnSend').disabled = true;
+
+  if (S.mode === 'chat') {
+    await streamChat(text);
+  } else {
+    await streamAgent(text);
+  }
+
+  S.streaming = false;
+  document.getElementById('btnSend').disabled = false;
+  await loadChats(); // refresh titles
+}
+
+async function streamChat(text) {
+  const settings = getSettings();
+  // Build messages from DOM
+  const msgs = [];
+  if (settings.system_prompt) msgs.push({role:'system', content:settings.system_prompt});
+  // Load messages from current chat
+  const r = await fetch(`/api/chats/${S.currentChat}/messages`);
+  const chatMsgs = await r.json();
+  for (const m of chatMsgs) {
+    msgs.push({role: m.role, content: m.content});
+  }
+
+  const resp = await fetch('/api/chat/completions', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({messages: msgs, settings})
+  });
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let assistantText = '';
+  const msgEl = appendMessage('assistant', '', []);
+  const contentEl = msgEl.querySelector('.msg-content');
+
+  let buffer = '';
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream:true});
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6);
+      if (payload === '[DONE]') break;
+      try {
+        const d = JSON.parse(payload);
+        if (d.error) { assistantText += `\n\nError: ${d.error}`; break; }
+        if (d.content) assistantText += d.content;
+      } catch {}
+    }
+    contentEl.innerHTML = renderMarkdown(assistantText);
+    document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+  }
+
+  // Save assistant message
+  if (assistantText) {
+    await fetch(`/api/chats/${S.currentChat}/messages`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({role:'assistant', content:assistantText})
+    });
+  }
+}
+
+async function streamAgent(text) {
+  const settings = getSettings();
+  const resp = await fetch('/api/agent/run', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({chat_id: S.currentChat, message: text, settings})
+  });
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let assistantText = '';
+  let toolCalls = [];
+  const msgEl = appendMessage('assistant', '', []);
+  const contentEl = msgEl.querySelector('.msg-content');
+
+  // Add tool calls container
+  let toolsEl = document.createElement('div');
+  toolsEl.className = 'tool-calls';
+  msgEl.insertBefore(toolsEl, contentEl);
+
+  let buffer = '';
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream:true});
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6);
+      if (payload === '[DONE]') continue;
+      try {
+        const d = JSON.parse(payload);
+        if (d.type === 'tool') {
+          toolCalls.push(d);
+          const tcLine = document.createElement('div');
+          tcLine.className = 'tool-call-line';
+          tcLine.textContent = '\u26A1 ' + (d.summary || d.tool);
+          toolsEl.appendChild(tcLine);
+        } else if (d.type === 'text') {
+          assistantText = d.content;
+          contentEl.innerHTML = renderMarkdown(assistantText);
+        } else if (d.type === 'error') {
+          assistantText = `Error: ${d.content}`;
+          contentEl.innerHTML = renderMarkdown(assistantText);
+        }
+      } catch {}
+    }
+    document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+  }
+}
+
+// ── Agent commands ──
+async function agentCmd(cmd) {
+  const statusEl = document.getElementById('cmdStatus');
+  statusEl.textContent = `Running /${cmd}...`;
+  const settings = getSettings();
+  try {
+    const r = await fetch('/api/agent/cmd', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({command: cmd, settings})
+    });
+    const data = await r.json();
+    if (data.error) {
+      statusEl.textContent = `Error: ${data.error}`;
+    } else {
+      statusEl.textContent = data.result;
+    }
+  } catch (e) {
+    statusEl.textContent = `Error: ${e.message}`;
+  }
+}
+</script>
+</body>
+</html>
 """
 
 
-def _handle_context_command(cmd: str, messages: list):
-    """/init | /reinit | /update — generate or refresh .agent_context.md."""
-    if cmd in ("/init", "/reinit"):
-        print("[scanning repo…]", flush=True)
-        file_map = scan_repo()
+# ── Entry point ──────────────────────────────────────────────────────────────
 
-        existing = None
-        if cmd == "/reinit" and CONTEXT_FILE.exists():
-            existing = CONTEXT_FILE.read_text()
-            print("[reconciling with existing context…]", flush=True)
-        else:
-            print("[generating context with AI…]", flush=True)
+def main():
+    global WORKDIR, AGENT_DATA_PATH
 
-        content = _ask_for_context(file_map, existing)
-        if not content:
-            print("[failed to generate context — check API]\n")
-            return
+    parser = argparse.ArgumentParser(description="Agent — LLM chat + coding agent")
+    parser.add_argument("--work-dir", type=str, default=None, help="Working directory for the agent")
+    parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind to")
+    args = parser.parse_args()
 
-        # Ensure it starts with the right header
-        if not content.startswith("# Repo Context"):
-            content = "# Repo Context\n\n" + content
+    if args.work_dir:
+        WORKDIR = Path(args.work_dir).resolve()
+        if not WORKDIR.is_dir():
+            print(f"Error: {WORKDIR} is not a directory", file=sys.stderr)
+            sys.exit(1)
 
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        content = f"{content}\n\n_Generated: {ts}_\n"
-        CONTEXT_FILE.write_text(content)
-        print(f"[written {CONTEXT_FILE.name} — {len(content)} chars]\n")
+    # Update settings defaults with current WORKDIR
+    data = load_data()
+    data["settings"]["workdir"] = str(WORKDIR)
+    save_data(data)
 
-    elif cmd == "/update":
-        if not CONTEXT_FILE.exists():
-            print("[no .agent_context.md found — run /init first]\n")
-            return
-        print("[updating context based on this session…]", flush=True)
-        content = _update_context_from_session(messages)
-        if not content:
-            print("[failed — check API]\n")
-            return
-        if not content.startswith("# Repo Context"):
-            content = "# Repo Context\n\n" + content
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        content = f"{content}\n\n_Updated: {ts}_\n"
-        CONTEXT_FILE.write_text(content)
-        print(f"[updated {CONTEXT_FILE.name}]\n")
+    print(f"Agent starting on http://{args.host}:{args.port}")
+    print(f"Working directory: {WORKDIR}")
 
+    import uvicorn
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
-def _refresh_system_msg(messages: list) -> list:
-    """Replace the first system message with a freshly built system prompt."""
-    new_sys = build_system_prompt()
-    if messages and messages[0]["role"] == "system":
-        messages[0]["content"] = new_sys
-    else:
-        messages.insert(0, {"role": "system", "content": new_sys})
-    return messages
-
-
-def run_interactive(resume_path: Path | None = None):
-    print(f"microagent  |  workdir: {WORKDIR}  |  model: {MODEL}")
-    print(f"base_url: {BASE_URL}")
-    if CONTEXT_FILE.exists():
-        print(f"[context: {CONTEXT_FILE.name} loaded]")
-    print("Type /help for commands, 'exit' to quit.\n")
-
-    current_session: list[Path | None] = [None]  # mutable ref for autosave
-
-    if resume_path:
-        messages = session_load(resume_path)
-        messages = _refresh_system_msg(messages)   # inject latest context
-        current_session[0] = resume_path
-        print(f"[resumed {resume_path.name} — {len(messages)-1} messages in context]\n")
-        worklog_session_open("interactive", resumed_from=resume_path)
-    else:
-        messages = [{"role": "system", "content": build_system_prompt()}]
-        worklog_session_open("interactive")
-
-    while True:
-        # Show context size hint when it's getting large
-        n = len(messages) - 1
-        prompt = f"[{n}]> " if n > 10 else "> "
-
-        try:
-            user_input = input(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
-            session_autosave(messages, current_session)
-            worklog_session_close()
-            return
-
-        if not user_input:
-            continue
-
-        if user_input.lower() in ("exit", "quit"):
-            session_autosave(messages, current_session)
-            worklog_session_close()
-            print(f"[saved {current_session[0].name}]")
-            print("Bye!")
-            return
-
-        if user_input == "/help":
-            print(_HELP)
-            continue
-
-        if user_input in ("/init", "/reinit", "/update"):
-            _handle_context_command(user_input, messages)
-            messages = _refresh_system_msg(messages)
-            continue
-
-        if user_input == "/clear":
-            messages = [{"role": "system", "content": build_system_prompt()}]
-            current_session[0] = None
-            print("[context cleared]\n")
-            continue
-
-        if user_input == "/save":
-            session_autosave(messages, current_session)
-            print(f"[saved {current_session[0].name}]\n")
-            continue
-
-        if user_input == "/summarize":
-            messages = offer_summarization(messages, current_session, force=True)
-            continue
-
-        if user_input == "/sessions":
-            files = session_list()
-            if not files:
-                print("(no saved sessions)\n")
-            else:
-                for i, f in enumerate(files):
-                    try:
-                        meta    = json.loads(f.read_text())
-                        nm      = len([m for m in meta.get("messages", []) if m["role"] != "system"])
-                        ts      = meta.get("last_updated", f.stem)[:16]
-                        preview = meta.get("preview") or _first_user_msg(meta.get("messages", []))
-                        print(f"  [{i}] {ts}  {nm:>3} msgs  {preview}")
-                    except Exception:
-                        print(f"  [{i}] {f.name}")
-                print()
-            continue
-
-        if user_input.startswith("/resume"):
-            files = session_list()
-            if not files:
-                print("[no sessions to resume]\n")
-                continue
-            parts = user_input.split()
-            idx   = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            if idx >= len(files):
-                print(f"[no session {idx}]\n")
-                continue
-            messages        = session_load(files[idx])
-            current_session[0] = files[idx]
-            print(f"[resumed {files[idx].name} — {len(messages)-1} messages]\n")
-            continue
-
-        # Offer summarization when context grows large
-        if _context_chars(messages) > MAX_CONTEXT_CHARS:
-            messages = offer_summarization(messages, current_session)
-
-        messages.append({"role": "user", "content": user_input})
-        worklog_turn(user_input)
-
-        text = _run_task(messages)
-
-        if text:
-            print(text, flush=True)
-            worklog_result(text)
-
-        # Auto-save after every completed turn
-        session_autosave(messages, current_session)
-
-
-def run_oneshot(task: str):
-    print(f"microagent  |  workdir: {WORKDIR}  |  model: {MODEL}")
-    print(f"base_url: {BASE_URL}\n", flush=True)
-
-    worklog_session_open("one-shot")
-    worklog_turn(task)
-    messages = [
-        {"role": "system", "content": build_system_prompt()},
-        {"role": "user",   "content": task},
-    ]
-
-    text = _run_task(messages)
-    if text:
-        print(text, flush=True)
-        worklog_result(text)
-    worklog_session_close()
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    args = list(sys.argv[1:])
-
-    # Parse --model and --url overrides before anything else
-    def _pop_flag(flag: str) -> str | None:
-        for i, a in enumerate(args):
-            if a == flag and i + 1 < len(args):
-                args.pop(i); return args.pop(i)
-            if a.startswith(flag + "="):
-                args.pop(i); return a.split("=", 1)[1]
-        return None
-
-    if (v := _pop_flag("--model")):
-        MODEL = v
-    if (v := _pop_flag("--url")):
-        BASE_URL = v.rstrip("/")
-
-    # --init: generate .agent_context.md then exit
-    if args and args[0] == "--init":
-        print(f"microagent  |  workdir: {WORKDIR}  |  model: {MODEL}")
-        msgs_dummy: list = []   # no session context needed for init
-        _handle_context_command("/init", msgs_dummy)
-        sys.exit(0)
-
-    # --resume [path|index]
-    if args and args[0] == "--resume":
-        files = session_list()
-        if not files:
-            print("No saved sessions found.")
-            sys.exit(1)
-        if len(args) > 1:
-            ref = args[1]
-            if ref.isdigit():
-                idx = int(ref)
-                resume = files[idx] if idx < len(files) else None
-            else:
-                resume = Path(ref)
-        else:
-            resume = files[0]   # last session
-        run_interactive(resume_path=resume)
-
-    elif args:
-        run_oneshot(" ".join(args))
-
-    else:
-        run_interactive()
+    main()
