@@ -347,6 +347,7 @@ def _empty_data():
             "api_key": os.environ.get("OPENAI_API_KEY", ""),
             "model": os.environ.get("OPENAI_MODEL", "gpt-4o"),
             "system_prompt": "",
+            "agent_extra_prompt": "",
             "temperature": 0.7,
             "max_tokens": 4096,
             "mode": "chat",
@@ -400,7 +401,7 @@ async def post_settings(req: Request):
     global WORKDIR
     body = await req.json()
     data = load_data()
-    for key in ("base_url", "api_key", "model", "system_prompt", "temperature", "max_tokens", "mode", "workdir"):
+    for key in ("base_url", "api_key", "model", "system_prompt", "agent_extra_prompt", "temperature", "max_tokens", "mode", "workdir"):
         if key in body:
             data["settings"][key] = body[key]
     # Validate and update WORKDIR
@@ -553,7 +554,7 @@ async def agent_run(req: Request):
             from openai import OpenAI
             client = OpenAI(base_url=base_url, api_key=api_key)
 
-            system_prompt = build_agent_system_prompt(settings.get("system_prompt", ""))
+            system_prompt = build_agent_system_prompt(settings.get("agent_extra_prompt", ""))
 
             # Load conversation history
             data = load_data()
@@ -882,8 +883,8 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
         <label>Model</label>
         <input id="sModel" placeholder="gpt-4o">
       </div>
-      <div>
-        <label>System Prompt</label>
+      <div id="chatSystemPromptRow">
+        <label>Chat System Prompt</label>
         <textarea id="sSystemPrompt" rows="3" placeholder="You are a helpful assistant."></textarea>
       </div>
       <div>
@@ -899,6 +900,10 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
         <div>
           <label>Working Directory</label>
           <input id="sWorkdir" placeholder="/path/to/project">
+        </div>
+        <div style="margin-top:10px">
+          <label>Agent Extra Prompt</label>
+          <textarea id="sAgentExtraPrompt" rows="3" placeholder="Extra instructions appended to the agent system prompt..."></textarea>
         </div>
         <div style="display:flex;gap:8px;margin-top:8px">
           <button class="btn-cmd" onclick="agentCmd('init')">/init</button>
@@ -938,6 +943,7 @@ function applySettings() {
   document.getElementById('sApiKey').value = S.settings.api_key || '';
   document.getElementById('sModel').value = S.settings.model || 'gpt-4o';
   document.getElementById('sSystemPrompt').value = S.settings.system_prompt || '';
+  document.getElementById('sAgentExtraPrompt').value = S.settings.agent_extra_prompt || '';
   document.getElementById('sTemperature').value = S.settings.temperature ?? 0.7;
   document.getElementById('sMaxTokens').value = S.settings.max_tokens ?? 4096;
   document.getElementById('sWorkdir').value = S.settings.workdir || '';
@@ -951,6 +957,7 @@ function getSettings() {
     api_key: document.getElementById('sApiKey').value,
     model: document.getElementById('sModel').value,
     system_prompt: document.getElementById('sSystemPrompt').value,
+    agent_extra_prompt: document.getElementById('sAgentExtraPrompt').value,
     temperature: parseFloat(document.getElementById('sTemperature').value) || 0.7,
     max_tokens: parseInt(document.getElementById('sMaxTokens').value) || 4096,
     mode: S.mode,
@@ -983,6 +990,7 @@ function setMode(mode) {
   document.getElementById('btnChat').classList.toggle('active', mode === 'chat');
   document.getElementById('btnCode').classList.toggle('active', mode === 'code');
   document.getElementById('agentSection').style.display = mode === 'code' ? 'block' : 'none';
+  document.getElementById('chatSystemPromptRow').style.display = mode === 'chat' ? 'block' : 'none';
 }
 
 // ── Sidebar ──
