@@ -321,7 +321,11 @@ def load_repo_context() -> str:
 
 def build_agent_system_prompt(custom_system: str = "") -> str:
     parts = []
-    parts.append("You are a coding agent. You help the user by reading, writing, and modifying files in their project.")
+    parts.append(
+        "You are a coding agent. You help the user by reading, writing, and modifying files.\n"
+        "ALWAYS use tools to answer questions about files and code — never guess or make up content.\n"
+        "Start by exploring the working directory with ls or read_file before making changes."
+    )
     if custom_system:
         parts.append(custom_system)
     parts.append(get_tools_prompt())
@@ -565,6 +569,7 @@ async def agent_run(req: Request):
             tool_calls_log = []
 
             for iteration in range(MAX_TOOL_CALLS):
+                queue.put({"type": "thinking"})
                 response = client.chat.completions.create(
                     model=model,
                     messages=api_messages,
@@ -768,6 +773,11 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .msg.assistant{background:transparent}
 .msg .tool-calls{margin-bottom:8px}
 .tool-call-line{font-family:var(--mono);font-size:11px;color:var(--text3);padding:2px 0;line-height:1.5}
+.thinking{display:inline-flex;gap:4px;padding:4px 2px;align-items:center}
+.thinking span{width:5px;height:5px;border-radius:50%;background:var(--text3);animation:thinking-bounce 1.2s infinite ease-in-out}
+.thinking span:nth-child(2){animation-delay:.2s}
+.thinking span:nth-child(3){animation-delay:.4s}
+@keyframes thinking-bounce{0%,80%,100%{transform:translateY(0);opacity:.4}40%{transform:translateY(-5px);opacity:1}}
 .msg .msg-content p{margin:0 0 8px 0}
 .msg .msg-content p:last-child{margin-bottom:0}
 .msg .msg-content pre{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;overflow-x:auto;margin:8px 0;font-family:var(--mono);font-size:12px;line-height:1.5}
@@ -1185,13 +1195,32 @@ async function streamAgent(text) {
   const decoder = new TextDecoder();
   let assistantText = '';
   let toolCalls = [];
-  const msgEl = appendMessage('assistant', '', []);
-  const contentEl = msgEl.querySelector('.msg-content');
+  let msgEl = null;
+  let contentEl = null;
+  let toolsEl = null;
+  let thinkingEl = null;
 
-  // Add tool calls container
-  let toolsEl = document.createElement('div');
-  toolsEl.className = 'tool-calls';
-  msgEl.insertBefore(toolsEl, contentEl);
+  function ensureBubble() {
+    if (msgEl) return;
+    msgEl = appendMessage('assistant', '', []);
+    contentEl = msgEl.querySelector('.msg-content');
+    toolsEl = document.createElement('div');
+    toolsEl.className = 'tool-calls';
+    msgEl.insertBefore(toolsEl, contentEl);
+  }
+
+  function showThinking() {
+    ensureBubble();
+    if (thinkingEl) return;
+    thinkingEl = document.createElement('div');
+    thinkingEl.className = 'thinking';
+    thinkingEl.innerHTML = '<span></span><span></span><span></span>';
+    toolsEl.appendChild(thinkingEl);
+  }
+
+  function hideThinking() {
+    if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+  }
 
   let buffer = '';
   while (true) {
@@ -1206,16 +1235,24 @@ async function streamAgent(text) {
       if (payload === '[DONE]') continue;
       try {
         const d = JSON.parse(payload);
-        if (d.type === 'tool') {
+        if (d.type === 'thinking') {
+          showThinking();
+        } else if (d.type === 'tool') {
+          hideThinking();
+          ensureBubble();
           toolCalls.push(d);
           const tcLine = document.createElement('div');
           tcLine.className = 'tool-call-line';
           tcLine.textContent = '\u26A1 ' + (d.summary || d.tool);
           toolsEl.appendChild(tcLine);
         } else if (d.type === 'text') {
+          hideThinking();
+          ensureBubble();
           assistantText = d.content;
           contentEl.innerHTML = renderMarkdown(assistantText);
         } else if (d.type === 'error') {
+          hideThinking();
+          ensureBubble();
           assistantText = `Error: ${d.content}`;
           contentEl.innerHTML = renderMarkdown(assistantText);
         }
@@ -1258,16 +1295,14 @@ def main():
     global WORKDIR, AGENT_DATA_PATH
 
     parser = argparse.ArgumentParser(description="Agent — LLM chat + coding agent")
-    parser.add_argument("--work-dir", type=str, default=None, help="Working directory for the agent")
+    _default_sandbox = str(Path(__file__).resolve().parent / "sandbox")
+    parser.add_argument("--work-dir", type=str, default=_default_sandbox, help="Working directory for the agent")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind to")
     args = parser.parse_args()
 
-    if args.work_dir:
-        WORKDIR = Path(args.work_dir).resolve()
-        if not WORKDIR.is_dir():
-            print(f"Error: {WORKDIR} is not a directory", file=sys.stderr)
-            sys.exit(1)
+    WORKDIR = Path(args.work_dir).resolve()
+    WORKDIR.mkdir(parents=True, exist_ok=True)
 
     # Update settings defaults with current WORKDIR
     data = load_data()
