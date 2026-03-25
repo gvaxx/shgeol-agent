@@ -570,19 +570,44 @@ async def agent_run(req: Request):
 
             for iteration in range(MAX_TOOL_CALLS):
                 queue.put({"type": "thinking"})
-                response = client.chat.completions.create(
+                stream = client.chat.completions.create(
                     model=model,
                     messages=api_messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    stream=True,
                 )
-                content = response.choices[0].message.content or ""
-                tc = _parse_tool_call(content)
+
+                content_buf = ""
+                is_tool_call = None  # None=undecided, True=JSON tool call, False=text
+
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta.content or ""
+                    if not delta:
+                        continue
+                    content_buf += delta
+
+                    # Decide on first non-whitespace character
+                    if is_tool_call is None and content_buf.lstrip():
+                        is_tool_call = content_buf.lstrip()[0] == "{"
+
+                    # Stream tokens to user only for text responses
+                    if is_tool_call is False:
+                        queue.put({"type": "token", "content": delta})
+
+                content = content_buf
+
+                # Parse tool call only if response started with '{'
+                tc = _parse_tool_call(content) if is_tool_call else None
+
+                # Fallback: if it looked like JSON but failed to parse, show as text
+                if is_tool_call and tc is None and content.strip():
+                    queue.put({"type": "token", "content": content})
 
                 if tc is None:
-                    # Final text response
-                    queue.put({"type": "text", "content": content})
-                    # Save assistant message with tool_calls metadata
+                    # Text response — already streamed token-by-token; save to storage
                     if chat_id:
                         data2 = load_data()
                         if chat_id in data2["chats"]:
@@ -1245,11 +1270,19 @@ async function streamAgent(text) {
           tcLine.className = 'tool-call-line';
           tcLine.textContent = '\u26A1 ' + (d.summary || d.tool);
           toolsEl.appendChild(tcLine);
-        } else if (d.type === 'text') {
+        } else if (d.type === 'token') {
           hideThinking();
           ensureBubble();
-          assistantText = d.content;
+          assistantText += d.content;
           contentEl.innerHTML = renderMarkdown(assistantText);
+        } else if (d.type === 'text') {
+          // Legacy fallback (non-streaming path)
+          hideThinking();
+          ensureBubble();
+          if (!assistantText) {
+            assistantText = d.content;
+            contentEl.innerHTML = renderMarkdown(assistantText);
+          }
         } else if (d.type === 'error') {
           hideThinking();
           ensureBubble();
