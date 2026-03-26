@@ -390,6 +390,41 @@ def build_agent_system_prompt(custom_system: str = "", workdir: Path = None) -> 
     return "\n\n".join(parts)
 
 
+# ── JSON storage (chats + settings) ──────────────────────────────────────────
+
+_data_lock = threading.Lock()
+
+def _empty_data():
+    return {
+        "settings": {
+            "base_url": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            "api_key": os.environ.get("OPENAI_API_KEY", ""),
+            "model": os.environ.get("OPENAI_MODEL", "gpt-4o"),
+            "system_prompt": "",
+            "agent_extra_prompt": "",
+            "temperature": 0.2,
+            "max_tokens": 4096,
+            "mode": "chat",
+            "workdir": str(WORKDIR),
+        },
+        "chats": {},
+    }
+
+def load_data() -> dict:
+    with _data_lock:
+        if AGENT_DATA_PATH.is_file():
+            try:
+                return json.loads(AGENT_DATA_PATH.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        return _empty_data()
+
+def save_data(data: dict):
+    with _data_lock:
+        AGENT_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AGENT_DATA_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+
 # ── History storage ───────────────────────────────────────────────────────────
 # Stores flat list of {role, content, timestamp, tool_calls?} objects.
 # Tool call details are stored for display but NOT fed back to model context.
@@ -652,9 +687,12 @@ async def agent_run(req: Request):
             tool_handlers = make_tool_handlers(chat_workdir)
             system_prompt = build_agent_system_prompt(settings.get("agent_extra_prompt", ""), chat_workdir)
 
-            # Load history from JSON; only pass role+content to model (no tool_calls metadata)
-            saved = load_history()
-            history_msgs = [{"role": m["role"], "content": m["content"]} for m in saved]
+            # Load conversation history from chat storage
+            data = load_data()
+            history_msgs = []
+            if chat_id and chat_id in data["chats"]:
+                for m in data["chats"][chat_id]["messages"]:
+                    history_msgs.append({"role": m["role"], "content": m["content"]})
 
             api_messages = [{"role": "system", "content": system_prompt}]
             api_messages.extend(history_msgs)
@@ -686,14 +724,20 @@ async def agent_run(req: Request):
                 tc = _parse_tool_call(content)
 
                 if tc is None:
-                    # Final text response — save user + assistant to JSON
-                    now = datetime.now(timezone.utc).isoformat()
-                    new_msgs = [
-                        {"role": "user", "content": user_message, "timestamp": now},
-                        {"role": "assistant", "content": content, "timestamp": now,
-                         "tool_calls": tool_calls_log},
-                    ]
-                    append_messages(new_msgs)
+                    # Final text response — save assistant message to chat storage
+                    if chat_id:
+                        data2 = load_data()
+                        if chat_id in data2["chats"]:
+                            msg = {
+                                "role": "assistant",
+                                "content": content,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            }
+                            if tool_calls_log:
+                                msg["tool_calls"] = tool_calls_log
+                            data2["chats"][chat_id]["messages"].append(msg)
+                            data2["chats"][chat_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+                            save_data(data2)
                     break
 
                 tool_name = tc["tool"]
