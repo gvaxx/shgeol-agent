@@ -83,9 +83,13 @@ def tool_read_file(path: str, workdir: Path = None) -> str:
     if not p.is_file():
         return f"ERROR: not a file: {path}"
     content = p.read_text(errors="replace")
+    truncated = ""
     if len(content) > 50_000:
-        return content[:50_000] + f"\n... [truncated at 50k chars, total {len(content)}]"
-    return content
+        content = content[:50_000]
+        truncated = f"\n... [truncated at 50k chars]"
+    lines = content.splitlines()
+    numbered = "\n".join(f"{i+1:4}: {line}" for i, line in enumerate(lines))
+    return numbered + truncated
 
 
 def tool_write_file(path: str, content: str, workdir: Path = None) -> str:
@@ -110,6 +114,26 @@ def tool_patch_file(path: str, old_str: str, new_str: str, workdir: Path = None)
     text = text.replace(old_str, new_str, 1)
     p.write_text(text)
     return f"OK: patched {path}"
+
+
+def tool_edit_lines(path: str, start: int, end: int, new_content: str, workdir: Path = None) -> str:
+    """Replace lines start..end (1-indexed, inclusive) with new_content."""
+    p = safe_path(path, workdir)
+    if not p.is_file():
+        return f"ERROR: not a file: {path}"
+    lines = p.read_text(errors="replace").splitlines(keepends=True)
+    total = len(lines)
+    if start < 1 or end < start or start > total:
+        return f"ERROR: invalid range {start}-{end}, file has {total} lines"
+    end = min(end, total)
+    # Ensure new_content ends with newline
+    replacement = new_content
+    if replacement and not replacement.endswith("\n"):
+        replacement += "\n"
+    new_lines = replacement.splitlines(keepends=True)
+    result = lines[:start - 1] + new_lines + lines[end:]
+    p.write_text("".join(result))
+    return f"OK: replaced lines {start}-{end} with {len(new_lines)} lines in {path}"
 
 
 def tool_ls(path: str = ".", workdir: Path = None) -> str:
@@ -178,6 +202,7 @@ def make_tool_handlers(workdir: Path = None):
         "read_file":  lambda args: tool_read_file(args.get("path", ""), wd),
         "write_file": lambda args: tool_write_file(args.get("path", ""), args.get("content", ""), wd),
         "patch_file": lambda args: tool_patch_file(args.get("path", ""), args.get("old_str", ""), args.get("new_str", ""), wd),
+        "edit_lines": lambda args: tool_edit_lines(args.get("path", ""), int(args.get("start", 1)), int(args.get("end", 1)), args.get("content", ""), wd),
         "ls":         lambda args: tool_ls(args.get("path", "."), wd),
         "grep":       lambda args: tool_grep(args.get("pattern", ""), args.get("path", "."), wd),
         "shell":      lambda args: tool_shell(args.get("command", ""), wd),
@@ -185,47 +210,55 @@ def make_tool_handlers(workdir: Path = None):
 
 
 def get_tools_prompt() -> str:
-    return """You have access to the following tools. To call a tool, you MUST use ONLY the exact XML format shown below.
-Do not wrap it in markdown or JSON.
+    return """You have access to the following tools. To call a tool, respond with ONLY the XML block — no other text.
 
-1. Read a file (max 50k chars):
+1. Read a file (returns content with line numbers):
 <read_file>
   <path>relative/path/to/file</path>
 </read_file>
 
-2. Write a new file (Max 2MB):
+2. Write a new file or overwrite entirely (max 2MB):
 <write_file>
   <path>relative/path/to/file</path>
-  <content>full content goes here</content>
+  <content>full content here</content>
 </write_file>
 
-3. Patch/Modify a file (Replace exactly 1 occurrence):
+3. Edit lines — replace lines start..end (1-indexed, inclusive) with new content.
+   PREFERRED for modifying existing files. After read_file you know exact line numbers.
+<edit_lines>
+  <path>relative/path/to/file</path>
+  <start>10</start>
+  <end>14</end>
+  <content>replacement lines here</content>
+</edit_lines>
+
+4. Patch file — replace exactly 1 occurrence of a string. Use only when you are certain the text is unique.
 <patch_file>
   <path>relative/path/to/file</path>
-  <old_str>exact existing text</old_str>
+  <old_str>exact existing text including indentation</old_str>
   <new_str>replacement text</new_str>
 </patch_file>
 
-4. List directory:
+5. List directory:
 <ls>
   <path>.</path>
 </ls>
 
-5. Grep (Recursive search):
+6. Grep — recursive search by regex:
 <grep>
   <pattern>regex_pattern</pattern>
   <path>.</path>
 </grep>
 
-6. Shell (Whitelisted: find, wc, head, tail, sort, uniq, diff, echo, pwd, date):
+7. Shell (allowed: find, wc, head, tail, sort, uniq, diff, echo, pwd, date):
 <shell>
-  <command>ls -la</command>
+  <command>wc -l main.py</command>
 </shell>
 
-IMPORTANT:
-- Output ONLY ONE tool call per response.
-- After receiving tool output, you may call another tool or provide your final answer.
-- When you are done and want to reply to the user, just write your response normally (no XML).
+RULES:
+- ONE tool call per response. Wait for the result before calling the next.
+- To modify an existing file: read_file first → see line numbers → use edit_lines.
+- When finished with all tool calls, write your final answer as plain text (no XML).
 """
 
 
@@ -246,7 +279,7 @@ def _parse_tool_call(content: str):
     tool_name = m.group(1)
     inner_xml = m.group(2)
 
-    if tool_name not in ["read_file", "write_file", "patch_file", "ls", "grep", "shell"]:
+    if tool_name not in ["read_file", "write_file", "patch_file", "edit_lines", "ls", "grep", "shell"]:
         return None
 
     args = {}
@@ -718,6 +751,8 @@ def _tool_summary(tool_name: str, args: dict, result: str) -> str:
         return f"write_file {args.get('path', '?')} → {result[:80]}"
     elif tool_name == "patch_file":
         return f"patch_file {args.get('path', '?')} → {result[:80]}"
+    elif tool_name == "edit_lines":
+        return f"edit_lines {args.get('path', '?')} [{args.get('start')}–{args.get('end')}] → {result[:60]}"
     elif tool_name == "ls":
         count = len(result.split("\n")) if result and not result.startswith("ERROR") else 0
         return f"ls {args.get('path', '.')} → {count} entries"
