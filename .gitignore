@@ -1,2 +1,8 @@
 sandbox/
 agent_data.json
+__pycache__/
+*.pyc
+.worklog.md
+.sessions/
+.agent_context.md
+history.json

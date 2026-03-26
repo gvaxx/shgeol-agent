@@ -62,7 +62,7 @@ _BINARY_EXTS = {
     ".sqlite", ".db", ".sqlite3",
 }
 
-_SHELL_WHITELIST = {"find", "wc", "head", "tail", "sort", "uniq", "diff", "echo", "pwd", "date"}
+_SHELL_WHITELIST = {"find", "wc", "head", "tail", "sort", "uniq", "diff", "echo", "pwd", "date", "mkdir"}
 _SHELL_META = set(";&|`$(){}><\n\\!")
 
 # ── Path safety ──────────────────────────────────────────────────────────────
@@ -376,9 +376,12 @@ def build_agent_system_prompt(custom_system: str = "", workdir: Path = None) -> 
         "You are an expert coding agent. You achieve goals by utilizing tools.\n"
         "\n"
         "STRICT RULES:\n"
-        "1. THINKING: Before taking ANY action, you MUST write down your thought process inside <thinking> tags.\n"
-        "2. ONE ACTION AT A TIME: Use ONLY ONE tool per response. Wait for the result.\n"
-        "3. EXACT MATCHING: When using <patch_file>, the <old_str> block MUST match the existing file content exactly, including spaces and indentation.\n"
+        "1. LANGUAGE: Always respond in the same language the user is writing in. If the user writes in Russian — respond in Russian.\n"
+        "2. ONLY TWO VALID RESPONSES: Either (a) a tool call — one XML block, nothing else, or (b) a final answer when the task is fully complete. There is no option (c). No explanations before acting, no lists of what you will do, no 'I will...', no 'Step 1...'. Silence before action is forbidden. Act immediately.\n"
+        "3. ONE TOOL PER RESPONSE: One XML block per message, no more. Wait for the result, then call the next tool.\n"
+        "4. THINKING: If you must reason, use <thinking>...</thinking> before the tool call. Keep it under 2 sentences.\n"
+        "5. EXACT MATCHING: When using <patch_file>, the <old_str> block MUST match the existing file content exactly, including spaces and indentation.\n"
+        "6. NO DELETION: Never delete files yourself. If a file needs to be deleted, tell the user the exact `rm` command to run manually. Do not call shell with rm.\n"
     )
     if custom_system:
         parts.append(custom_system)
@@ -425,44 +428,6 @@ def save_data(data: dict):
         AGENT_DATA_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-# ── History storage ───────────────────────────────────────────────────────────
-# Stores flat list of {role, content, timestamp, tool_calls?} objects.
-# Tool call details are stored for display but NOT fed back to model context.
-
-HISTORY_PATH: Path = Path(
-    os.environ.get("HISTORY_PATH", str(Path(__file__).resolve().parent / "history.json"))
-)
-_history_lock = threading.Lock()
-
-
-def load_history() -> list:
-    with _history_lock:
-        if HISTORY_PATH.is_file():
-            try:
-                return json.loads(HISTORY_PATH.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
-        return []
-
-
-def save_history(messages: list):
-    with _history_lock:
-        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        HISTORY_PATH.write_text(json.dumps(messages, ensure_ascii=False, indent=2))
-
-
-def append_messages(new_msgs: list):
-    """Thread-safe append of new messages to the history file."""
-    with _history_lock:
-        existing = []
-        if HISTORY_PATH.is_file():
-            try:
-                existing = json.loads(HISTORY_PATH.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
-        existing.extend(new_msgs)
-        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        HISTORY_PATH.write_text(json.dumps(existing, ensure_ascii=False, indent=2))
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
@@ -481,18 +446,6 @@ _HTML_FILE = Path(__file__).resolve().parent / "index.html"
 async def index():
     return FileResponse(_HTML_FILE)
 
-
-# ── Routes: History ───────────────────────────────────────────────────────────
-
-@app.get("/api/history")
-async def get_history():
-    return JSONResponse(load_history())
-
-
-@app.delete("/api/history")
-async def clear_history():
-    save_history([])
-    return JSONResponse({"ok": True})
 
 
 # ── Routes: Settings ─────────────────────────────────────────────────────────
@@ -699,8 +652,15 @@ async def agent_run(req: Request):
             api_messages.append({"role": "user", "content": user_message})
 
             tool_calls_log = []
+            ts = lambda: datetime.now().strftime("%H:%M:%S")
+
+            print(f"[{ts()}] agent: start  chat={chat_id[:8] if chat_id else '-'}  model={model}  workdir={chat_workdir}", flush=True)
+            print(f"[{ts()}] agent: user message: {user_message[:120]}", flush=True)
 
             for iteration in range(MAX_TOOL_CALLS):
+                print(f"[{ts()}] agent: iteration {iteration + 1}  calling LLM ({len(api_messages)} messages in context)...", flush=True)
+                queue.put({"type": "thinking"})
+
                 stream = client.chat.completions.create(
                     model=model,
                     messages=api_messages,
@@ -721,10 +681,12 @@ async def agent_run(req: Request):
                     queue.put({"type": "token", "content": delta})
 
                 content = content_buf
+                print(f"[{ts()}] agent: LLM response ({len(content)} chars): {content[:200].replace(chr(10), ' ')}", flush=True)
                 tc = _parse_tool_call(content)
 
                 if tc is None:
                     # Final text response — save assistant message to chat storage
+                    print(f"[{ts()}] agent: final answer, saving to chat", flush=True)
                     if chat_id:
                         data2 = load_data()
                         if chat_id in data2["chats"]:
@@ -743,27 +705,31 @@ async def agent_run(req: Request):
                 tool_name = tc["tool"]
                 tool_args = tc["args"]
 
+                print(f"[{ts()}] agent: tool call → {tool_name}  args={str(tool_args)[:120]}", flush=True)
+
                 handler = tool_handlers.get(tool_name)
                 if handler is None:
                     result = f"ERROR: unknown tool '{tool_name}'"
+                    print(f"[{ts()}] agent: ERROR unknown tool '{tool_name}'", flush=True)
                 else:
                     try:
                         result = handler(tool_args)
+                        print(f"[{ts()}] agent: tool result ({len(str(result))} chars): {str(result)[:120].replace(chr(10), ' ')}", flush=True)
                     except Exception as e:
                         result = f"ERROR: {e}"
+                        print(f"[{ts()}] agent: tool ERROR: {e}", flush=True)
 
                 # Summarize for display
                 summary = _tool_summary(tool_name, tool_args, result)
                 tool_calls_log.append({"tool": tool_name, "args": tool_args, "summary": summary})
                 queue.put({"type": "tool", "tool": tool_name, "summary": summary})
 
-                # Status update instead of markdown (prevents weird parsing of '---')
-                queue.put({"type": "status", "content": "Analyzing tool output..."})
-
                 # Feed result back to the model
+
                 api_messages.append({"role": "assistant", "content": content})
                 api_messages.append({"role": "user", "content": f"[Tool result for {tool_name}]\n{result}"})
             else:
+                print(f"[{ts()}] agent: reached MAX_TOOL_CALLS ({MAX_TOOL_CALLS}), stopping", flush=True)
                 queue.put({"type": "text", "content": f"(Reached maximum of {MAX_TOOL_CALLS} tool calls. Stopping.)"})
 
         except Exception as e:

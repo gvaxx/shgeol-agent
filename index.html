@@ -38,9 +38,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .chat-item .chat-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-item .chat-delete{display:none;background:none;border:none;color:var(--text-muted);cursor:pointer;padding:0 4px;font-size:16px}
 .chat-item:hover .chat-delete{display:block}
-.chat-item .chat-delete:hover{color:#ef4444}
-.chat-workdir{font-size:11px;color:var(--text-muted);font-family:var(--mono);margin-top:4px}
-/* Main */
+.chat-item .chat-delete:hover{color:#ef4444}/* Main */
 .main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg)}
 /* Topbar */
 .topbar{height:56px;display:flex;align-items:center;padding:0 16px;gap:16px;flex-shrink:0;border-bottom:1px solid var(--border)}
@@ -69,15 +67,16 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .msg.assistant{align-items:flex-start}
 .msg.assistant .msg-content{width:100%}
 /* Tool Call Formatting & Animations */
-.xml-thinking{background:#fdfaf6;border-left:3px solid #e2c08d;padding:16px;margin:16px 0;border-radius:0 8px 8px 0;font-size:14px;color:#6b5a45}
-.xml-thinking-header{font-weight:600;color:#a18051;margin-bottom:8px;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}
+.xml-thinking{border:1px solid #e2c08d;border-radius:8px;margin:12px 0;overflow:hidden;background:#fdfaf6}
+.xml-thinking summary{font-size:11px;font-weight:600;color:#a18051;padding:8px 14px;cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;text-transform:uppercase;letter-spacing:0.5px;outline:none}
+.xml-thinking summary::-webkit-details-marker{display:none}
+.xml-thinking[open] summary{border-bottom:1px solid #e2c08d}
+.xml-thinking-content{padding:12px 14px;font-size:13px;color:#6b5a45;line-height:1.6}
 .xml-tool{border:1px solid var(--border);padding:12px 16px;margin:16px 0;border-radius:8px;background:var(--surface)}
 .xml-tool summary{font-weight:600;color:var(--text-muted);font-size:12px;font-family:var(--mono);text-transform:uppercase;letter-spacing:0.5px;display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;outline:none}
 .xml-tool summary::-webkit-details-marker{display:none}
 .xml-tool[open] summary{margin-bottom:12px;color:var(--text)}
 .xml-tool-content pre{margin:0!important;background:var(--bg)!important;border:1px solid var(--border)!important;border-radius:6px}
-/* Loaders and Status Indicators */
-.status-indicator{font-size:13px;color:var(--text-muted);margin-top:16px;font-style:italic;display:flex;align-items:center;gap:8px}
 .pulsing{animation:pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 /* Markdown Styles */
@@ -95,11 +94,23 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
 .btn-send{position:absolute;right:12px;bottom:10px;background:var(--accent);color:white;border:none;border-radius:8px;width:32px;height:32px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:0.2s}
 .btn-send:hover{background:var(--accent-hover)}
 .btn-send:disabled{background:var(--border);color:var(--text-muted);cursor:not-allowed}
+.btn-send.stop{background:#ef4444}
+.btn-send.stop:hover{background:#dc2626}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:#9ca3af}
 .empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--text-muted);font-size:16px;gap:12px}
+/* Tool calls log */
+.tool-calls-log{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.tool-call-entry{font-family:var(--mono);font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:6px}
+.tool-call-entry::before{content:'⚡';font-size:10px}
+/* Thinking loader */
+.thinking-dots{display:inline-flex;gap:5px;padding:4px 0 8px}
+.thinking-dots span{width:6px;height:6px;border-radius:50%;background:var(--text-muted);animation:tdot 1.2s infinite ease-in-out}
+.thinking-dots span:nth-child(2){animation-delay:.2s}
+.thinking-dots span:nth-child(3){animation-delay:.4s}
+@keyframes tdot{0%,80%,100%{transform:translateY(0);opacity:.3}40%{transform:translateY(-5px);opacity:1}}
 </style>
 </head>
 <body>
@@ -132,7 +143,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
       <div class="input-area">
         <div class="input-wrap">
           <textarea id="input" rows="1" placeholder="Message agent..." onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
-          <button class="btn-send" id="btnSend" onclick="sendMessage()">&#9650;</button>
+          <button class="btn-send" id="btnSend" onclick="handleSendStop()">&#9650;</button>
         </div>
       </div>
     </div>
@@ -158,7 +169,7 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
   </div>
 </div>
 <script>
-let S = { chats: [], currentChat: null, settings: {}, mode: 'chat', streaming: false };
+let S = { chats: [], currentChat: null, settings: {}, mode: 'chat', streaming: false, abortCtrl: null };
 (async function init() {
   await loadSettings();
   await loadChats();
@@ -232,7 +243,6 @@ function renderChatList() {
   for (const c of S.chats) {
     const d = document.createElement('div');
     d.className = 'chat-item' + (S.currentChat === c.id ? ' active' : '');
-    const wdLabel = (c.mode === 'code' && c.workdir) ? `<div class="chat-workdir">${esc(c.workdir.split('/').pop() || c.workdir)}</div>` : '';
     d.innerHTML = `<span class="chat-title">${esc(c.title)}</span><button class="chat-delete" onclick="event.stopPropagation();deleteChat('${c.id}')">&times;</button>`;
     d.onclick = () => openChat(c.id);
     d.ondblclick = () => renameChat(c.id, c.title);
@@ -269,16 +279,17 @@ async function renameChat(id, oldTitle) {
 function processXML(text) {
   if (!text) return '';
   text = text.replace(/<thinking>([\s\S]*?)<\/thinking>/g, (match, content) => {
-    return `<div class="xml-thinking"><div class="xml-thinking-header">Internal Thought Process</div><div class="xml-thinking-content">${esc(content.trim()).replace(/\n/g, '<br>')}</div></div>`;
+    return `<details class="xml-thinking"><summary>💭 Thinking</summary><div class="xml-thinking-content">${esc(content.trim()).replace(/\n/g, '<br>')}</div></details>`;
   });
   if (text.includes('<thinking>') && !text.includes('</thinking>')) {
     const parts = text.split('<thinking>');
     const content = parts.pop();
-    text = parts.join('<thinking>') + `<div class="xml-thinking pulsing"><div class="xml-thinking-header">🤔 Thinking...</div><div class="xml-thinking-content">${esc(content.trim()).replace(/\n/g, '<br>')}</div></div>`;
+    text = parts.join('<thinking>') + `<details class="xml-thinking" open><summary class="pulsing">💭 Thinking...</summary><div class="xml-thinking-content">${esc(content.trim()).replace(/\n/g, '<br>')}</div></details>`;
   }
   const toolRegex = /<([a-zA-Z_]+)>([\s\S]*?)<\/\1>/g;
   text = text.replace(toolRegex, (match, tag, content) => {
-    if (['div', 'span', 'p', 'pre', 'code', 'html', 'body'].includes(tag.toLowerCase())) return match;
+    if (['div', 'span', 'p', 'pre', 'code', 'html', 'body', 'summary', 'details',
+         'ul', 'ol', 'li', 'strong', 'em', 'a', 'br', 'h1', 'h2', 'h3'].includes(tag.toLowerCase())) return match;
     return `<details class="xml-tool">
               <summary><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg> Tool Call: ${tag}</summary>
               <div class="xml-tool-content"><pre><code>${esc(content.trim())}</code></pre></div>
@@ -288,15 +299,46 @@ function processXML(text) {
 }
 function renderMarkdown(text) {
   if (!text) return '';
-  let processed = processXML(text);
-  processed = processed.replace(/`{3}(\w*)\n([\s\S]*?)`{3}/g, (_, lang, code) => `<pre><code>${esc(code.trim())}</code></pre>`);
-  processed = processed.replace(/`([^`]+)`/g, (_, c) => `<code>${esc(c)}</code>`);
-  processed = processed.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  const parts = processed.split(/\n\n+/);
-  return parts.map(p => {
-    if (['<pre>', '<h', '<div', '<details'].some(prefix => p.trim().startsWith(prefix))) return p;
-    return `<p>${p.replace(/\n/g, '<br>')}</p>`;
+  // Step 1: extract code blocks FIRST to protect them from XML processing
+  const codeBlocks = [];
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push(`<pre><code>${esc(code.trim())}</code></pre>`);
+    return `\x00CODE${idx}\x00`;
+  });
+  // Step 2: XML / thinking
+  let t = processXML(text);
+  // Step 3: inline code, bold
+  t = t.replace(/`([^`\n]+)`/g, (_, c) => `<code>${esc(c)}</code>`);
+  t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Step 4: block-level rendering
+  const blocks = t.split(/\n\n+/);
+  let result = blocks.map(block => {
+    const trimmed = block.trim();
+    if (!trimmed) return '';
+    if (/^\x00CODE\d+\x00$/.test(trimmed)) return trimmed; // placeholder
+    if (['<pre>', '<div', '<details', '<ul', '<ol', '<p'].some(p => trimmed.startsWith(p))) return trimmed;
+    if (/^#{1,3} /.test(trimmed)) {
+      return trimmed.replace(/^(#{1,3}) (.+)$/m, (_, hashes, content) => {
+        const level = hashes.length;
+        const sizes = { 1: '1.4em', 2: '1.2em', 3: '1.05em' };
+        return `<p style="font-size:${sizes[level]};font-weight:600;margin-bottom:4px">${content}</p>`;
+      });
+    }
+    const lines = trimmed.split('\n');
+    if (lines.length > 0 && lines.every(l => /^[-*] /.test(l.trim()) || l.trim() === '')) {
+      const items = lines.filter(l => l.trim()).map(l => `<li>${l.replace(/^[-*] /, '').trim()}</li>`).join('');
+      return `<ul style="padding-left:20px;margin:0 0 8px">${items}</ul>`;
+    }
+    if (lines.every(l => /^\d+\. /.test(l.trim()) || l.trim() === '')) {
+      const items = lines.filter(l => l.trim()).map(l => `<li>${l.replace(/^\d+\. /, '').trim()}</li>`).join('');
+      return `<ol style="padding-left:20px;margin:0 0 8px">${items}</ol>`;
+    }
+    return `<p>${trimmed.replace(/\n/g, '<br>')}</p>`;
   }).join('');
+  // Step 5: restore code blocks
+  codeBlocks.forEach((block, i) => { result = result.split(`\x00CODE${i}\x00`).join(block); });
+  return result;
 }
 function renderMessages(msgs) {
   const el = document.getElementById('messages');
@@ -305,22 +347,44 @@ function renderMessages(msgs) {
     el.innerHTML = '<div class="empty-state">How can I help you today?</div>';
     return;
   }
-  for (const m of msgs) appendMessage(m.role, m.content);
+  for (const m of msgs) appendMessage(m.role, m.content, m.tool_calls || []);
   el.scrollTop = el.scrollHeight;
 }
-function appendMessage(role, content) {
+function appendMessage(role, content, toolCalls) {
   const el = document.getElementById('messages');
   const empty = document.getElementById('emptyState');
   if (empty) empty.remove();
   const d = document.createElement('div');
   d.className = `msg ${role}`;
-  d.innerHTML = `<div class="msg-content">${renderMarkdown(content)}</div>`;
+  let toolHtml = '';
+  if (toolCalls && toolCalls.length) {
+    const entries = toolCalls.map(tc => `<div class="tool-call-entry">${esc(tc.tool)} ${esc(tc.summary || '')}</div>`).join('');
+    toolHtml = `<div class="tool-calls-log">${entries}</div>`;
+  }
+  d.innerHTML = `${toolHtml}<div class="msg-content">${renderMarkdown(content)}</div>`;
   el.appendChild(d);
   el.scrollTop = el.scrollHeight;
   return d;
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
+function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendStop(); } }
+function handleSendStop() { if (S.streaming) stopStreaming(); else sendMessage(); }
+function stopStreaming() {
+  if (S.abortCtrl) { S.abortCtrl.abort(); S.abortCtrl = null; }
+}
+function setStreaming(val) {
+  S.streaming = val;
+  const btn = document.getElementById('btnSend');
+  if (val) {
+    btn.innerHTML = '&#9632;'; // stop square
+    btn.classList.add('stop');
+    btn.disabled = false;
+  } else {
+    btn.innerHTML = '&#9650;'; // send arrow
+    btn.classList.remove('stop');
+    btn.disabled = false;
+  }
+}
 function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 200) + 'px'; }
 async function sendMessage() {
   const input = document.getElementById('input');
@@ -337,12 +401,16 @@ async function sendMessage() {
   await fetch(`/api/chats/${S.currentChat}/messages`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({role:'user', content:text}) });
   appendMessage('user', text);
   input.value = ''; input.style.height = 'auto';
-  S.streaming = true; document.getElementById('btnSend').disabled = true;
-  if (S.mode === 'chat') await streamChat(text);
-  else await streamAgent(text);
-  S.streaming = false; document.getElementById('btnSend').disabled = false;
+  setStreaming(true);
+  S.abortCtrl = new AbortController();
+  try {
+    if (S.mode === 'chat') await streamChat(text, S.abortCtrl.signal);
+    else await streamAgent(text, S.abortCtrl.signal);
+  } catch(e) { if (e.name !== 'AbortError') console.error(e); }
+  S.abortCtrl = null;
+  setStreaming(false);
 }
-async function streamChat(text) {
+async function streamChat(text, signal) {
   const settings = getSettings();
   const msgs = [];
   if (settings.system_prompt) msgs.push({role:'system', content:settings.system_prompt});
@@ -351,13 +419,18 @@ async function streamChat(text) {
   for (const m of chatMsgs) msgs.push({role: m.role, content: m.content});
   const resp = await fetch('/api/chat/completions', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({messages: msgs, settings})
+    body:JSON.stringify({messages: msgs, settings}), signal
   });
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let assistantText = '';
   const msgEl = appendMessage('assistant', '');
   const contentEl = msgEl.querySelector('.msg-content');
+  const chatDotsEl = document.createElement('div');
+  chatDotsEl.className = 'thinking-dots';
+  chatDotsEl.innerHTML = '<span></span><span></span><span></span>';
+  msgEl.insertBefore(chatDotsEl, contentEl);
+  let chatFirstToken = true;
   let buffer = '';
   while (true) {
     const {done, value} = await reader.read();
@@ -373,6 +446,7 @@ async function streamChat(text) {
         const d = JSON.parse(payload);
         if (d.error) { assistantText += `\n\nError: ${d.error}`; break; }
         if (d.content) {
+          if (chatFirstToken) { chatDotsEl.remove(); chatFirstToken = false; }
           assistantText += d.content;
           contentEl.innerHTML = renderMarkdown(assistantText);
           document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
@@ -380,6 +454,7 @@ async function streamChat(text) {
       } catch {}
     }
   }
+  if (chatFirstToken) chatDotsEl.remove();
   if (assistantText) {
     await fetch(`/api/chats/${S.currentChat}/messages`, {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -387,19 +462,34 @@ async function streamChat(text) {
     });
   }
 }
-async function streamAgent(text) {
+async function streamAgent(text, signal) {
   const settings = getSettings();
-  const resp = await fetch('/api/agent/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id: S.currentChat, message: text, settings}) });
+  // Create bubble
+  const msgEl = appendMessage('assistant', '');
+  const contentEl = msgEl.querySelector('.msg-content');
+  const toolLogEl = document.createElement('div');
+  toolLogEl.className = 'tool-calls-log';
+  msgEl.insertBefore(toolLogEl, contentEl);
+
+  let dotsEl = null;
+  function showDots() {
+    if (dotsEl && dotsEl.parentNode) return; // already shown
+    dotsEl = document.createElement('div');
+    dotsEl.className = 'thinking-dots';
+    dotsEl.innerHTML = '<span></span><span></span><span></span>';
+    msgEl.insertBefore(dotsEl, contentEl);
+    document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+  }
+  function hideDots() {
+    if (dotsEl && dotsEl.parentNode) { dotsEl.remove(); dotsEl = null; }
+  }
+
+  showDots(); // show immediately before first LLM call
+
+  const resp = await fetch('/api/agent/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id: S.currentChat, message: text, settings}), signal });
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let assistantText = '';
-  let statusHtml = '';
-  let msgEl = null, contentEl = null;
-  function ensureBubble() {
-    if (msgEl) return;
-    msgEl = appendMessage('assistant', '');
-    contentEl = msgEl.querySelector('.msg-content');
-  }
   let buffer = '';
   while (true) {
     const {done, value} = await reader.read();
@@ -413,23 +503,29 @@ async function streamAgent(text) {
       if (payload === '[DONE]') continue;
       try {
         const d = JSON.parse(payload);
-        ensureBubble();
-        if (d.type === 'token') {
-          statusHtml = '';
+        if (d.type === 'thinking') {
+          // New LLM call starting — show dots again
+          showDots();
+        } else if (d.type === 'token') {
+          hideDots(); // first token means model is responding
           assistantText += d.content;
+          contentEl.innerHTML = renderMarkdown(assistantText);
         } else if (d.type === 'error') {
-          statusHtml = '';
+          hideDots();
           assistantText += `\n\n**Error:** ${d.content}`;
+          contentEl.innerHTML = renderMarkdown(assistantText);
         } else if (d.type === 'tool') {
-          statusHtml = `<div class="status-indicator pulsing">⚙️ Executing tool: ${d.tool}...</div>`;
-        } else if (d.type === 'status') {
-          statusHtml = `<div class="status-indicator pulsing">🔄 ${d.content}</div>`;
+          const entry = document.createElement('div');
+          entry.className = 'tool-call-entry';
+          entry.textContent = `${d.tool} ${d.summary || ''}`;
+          toolLogEl.appendChild(entry);
+          showDots();
         }
-        contentEl.innerHTML = renderMarkdown(assistantText) + statusHtml;
       } catch {}
     }
     document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
   }
+  hideDots(); // clean up if stream ended unexpectedly
 }
 async function agentCmd(cmd) {
   const statusEl = document.getElementById('cmdStatus');
