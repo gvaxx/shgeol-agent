@@ -169,13 +169,17 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh
   </div>
 </div>
 <script>
+// Resolve API base dynamically so the app works behind JupyterHub / any reverse proxy.
+const API_BASE = window.location.pathname.replace(/\/+$/, '');
+function api(path) { return API_BASE + path; }
+
 let S = { chats: [], currentChat: null, settings: {}, mode: 'chat', streaming: false, abortCtrl: null };
 (async function init() {
   await loadSettings();
   await loadChats();
 })();
 async function loadSettings() {
-  const r = await fetch('/api/settings');
+  const r = await fetch(api('/api/settings'));
   if(r.ok) {
     S.settings = await r.json();
     applySettings();
@@ -208,7 +212,7 @@ function getSettings() {
 }
 async function saveSettings() {
   const s = getSettings();
-  const r = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(s)});
+  const r = await fetch(api('/api/settings'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(s)});
   if(r.ok) {
     S.settings = await r.json();
     document.getElementById('modelBadge').textContent = S.settings.model || 'gpt-4o';
@@ -234,7 +238,7 @@ function setMode(mode, silent) {
 function toggleSidebar() { document.getElementById('sidebar').classList.toggle('hidden'); }
 function toggleSettings() { document.getElementById('settingsPanel').classList.toggle('open'); }
 async function loadChats() {
-  const r = await fetch(`/api/chats?mode=${S.mode}`);
+  const r = await fetch(api(`/api/chats?mode=${S.mode}`));
   if(r.ok) { S.chats = await r.json(); renderChatList(); }
 }
 function renderChatList() {
@@ -252,17 +256,17 @@ function renderChatList() {
 async function newChat() {
   const settings = getSettings();
   const body = {mode: S.mode, workdir: settings.workdir};
-  const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const r = await fetch(api('/api/chats'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   if(r.ok) { const c = await r.json(); await loadChats(); openChat(c.id); }
 }
 async function openChat(id) {
   S.currentChat = id;
   renderChatList();
-  const r = await fetch(`/api/chats/${id}/messages`);
+  const r = await fetch(api(`/api/chats/${id}/messages`));
   if(r.ok) { const msgs = await r.json(); renderMessages(msgs); }
 }
 async function deleteChat(id) {
-  await fetch(`/api/chats/${id}`, {method:'DELETE'});
+  await fetch(api(`/api/chats/${id}`), {method:'DELETE'});
   if (S.currentChat === id) {
     S.currentChat = null;
     document.getElementById('messages').innerHTML = '<div class="empty-state">How can I help you today?</div>';
@@ -272,7 +276,7 @@ async function deleteChat(id) {
 async function renameChat(id, oldTitle) {
   const title = prompt('Rename chat:', oldTitle);
   if (title && title !== oldTitle) {
-    await fetch(`/api/chats/${id}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title})});
+    await fetch(api(`/api/chats/${id}`), {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title})});
     await loadChats();
   }
 }
@@ -393,12 +397,12 @@ async function sendMessage() {
   if (!S.currentChat) {
     const settings = getSettings();
     const body = {mode: S.mode, workdir: settings.workdir};
-    const r = await fetch('/api/chats', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const r = await fetch(api('/api/chats'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
     const c = await r.json();
     S.currentChat = c.id;
     await loadChats();
   }
-  await fetch(`/api/chats/${S.currentChat}/messages`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({role:'user', content:text}) });
+  await fetch(api(`/api/chats/${S.currentChat}/messages`), { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({role:'user', content:text}) });
   appendMessage('user', text);
   input.value = ''; input.style.height = 'auto';
   setStreaming(true);
@@ -414,10 +418,10 @@ async function streamChat(text, signal) {
   const settings = getSettings();
   const msgs = [];
   if (settings.system_prompt) msgs.push({role:'system', content:settings.system_prompt});
-  const r = await fetch(`/api/chats/${S.currentChat}/messages`);
+  const r = await fetch(api(`/api/chats/${S.currentChat}/messages`));
   const chatMsgs = await r.json();
   for (const m of chatMsgs) msgs.push({role: m.role, content: m.content});
-  const resp = await fetch('/api/chat/completions', {
+  const resp = await fetch(api('/api/chat/completions'), {
     method:'POST', headers:{'Content-Type':'application/json'},
     body:JSON.stringify({messages: msgs, settings}), signal
   });
@@ -456,7 +460,7 @@ async function streamChat(text, signal) {
   }
   if (chatFirstToken) chatDotsEl.remove();
   if (assistantText) {
-    await fetch(`/api/chats/${S.currentChat}/messages`, {
+    await fetch(api(`/api/chats/${S.currentChat}/messages`), {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({role:'assistant', content:assistantText})
     });
@@ -486,7 +490,7 @@ async function streamAgent(text, signal) {
 
   showDots(); // show immediately before first LLM call
 
-  const resp = await fetch('/api/agent/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id: S.currentChat, message: text, settings}), signal });
+  const resp = await fetch(api('/api/agent/run'), { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({chat_id: S.currentChat, message: text, settings}), signal });
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let assistantText = '';
@@ -532,7 +536,7 @@ async function agentCmd(cmd) {
   statusEl.textContent = `Running /${cmd}...`;
   const settings = getSettings();
   try {
-    const r = await fetch('/api/agent/cmd', {
+    const r = await fetch(api('/api/agent/cmd'), {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({command: cmd, settings})
     });
